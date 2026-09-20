@@ -41,6 +41,7 @@ bool op_datatype_raw_concat(value_t *lhs, value_t *rhs) {
     memcpy(&lhs->unk[lhs->size], rhs->unk, rhs->size * sizeof(bool));
 
     lhs->size += rhs->size;
+    lhs->approximated |= rhs->approximated;
     return true;
 }
 

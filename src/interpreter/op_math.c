@@ -45,16 +45,22 @@ inline int max(int a, int b) { return a > b ? a : b; }
     }\
 }
 
+/*
+ * Bitwise ops keep the LHS type:
+ *   signed   -> operates on the signed representation (arithmetic '>>', as in C)
+ *   unsigned -> operates on the unsigned representation (logical '>>')
+ *   float    -> operates on the raw IEEE-754 bit pattern (logical '>>')
+ */
 #define __math_do_infix_op_bw(lhs, rhs, op)\
     bool ret = true;\
 {\
     switch (lhs->type) {\
         case DATA_TYPE_SIGNED:\
-        case DATA_TYPE_FLOAT:\
-            lhs->data.uint32 op##= rhs->data.uint32;\
+            lhs->data.int32 op##= rhs->data.uint32;\
             break;\
         case DATA_TYPE_UNSIGNED:\
-            lhs->data.int32 op##= rhs->data.uint32;\
+        case DATA_TYPE_FLOAT:\
+            lhs->data.uint32 op##= rhs->data.uint32;\
             break;\
         default: ret = false; break;\
     }\
@@ -111,6 +117,7 @@ bool op_math_divide(value_t *lhs, value_t *rhs) {
     switch (lhs->type) {
         case DATA_TYPE_SIGNED:
             if (rhs->data.int32 == 0) return false;
+            if (lhs->data.int32 == INT32_MIN && rhs->data.int32 == -1) return false; // overflow
             lhs->data.int32 /= rhs->data.int32;
             break;
         case DATA_TYPE_UNSIGNED:
@@ -130,6 +137,7 @@ bool op_math_modulo(value_t *lhs, value_t *rhs) {
     switch (lhs->type) {
         case DATA_TYPE_SIGNED:
             if (rhs->data.int32 == 0) return false;
+            if (lhs->data.int32 == INT32_MIN && rhs->data.int32 == -1) return false; // overflow
             lhs->data.int32 %= rhs->data.int32;
             break;
         case DATA_TYPE_UNSIGNED:

@@ -7,6 +7,13 @@
 
 #define INTP_PRIMITIVE_SIZE 4
 
+#define NEST_OPEN_7   "((((((("
+#define NEST_CLOSE_7  ")))))))"
+#define NEST_OPEN_63  NEST_OPEN_7  NEST_OPEN_7  NEST_OPEN_7  NEST_OPEN_7  NEST_OPEN_7  NEST_OPEN_7  NEST_OPEN_7  NEST_OPEN_7  NEST_OPEN_7
+#define NEST_CLOSE_63 NEST_CLOSE_7 NEST_CLOSE_7 NEST_CLOSE_7 NEST_CLOSE_7 NEST_CLOSE_7 NEST_CLOSE_7 NEST_CLOSE_7 NEST_CLOSE_7 NEST_CLOSE_7
+#define NEST_OPEN_64  NEST_OPEN_63  "("
+#define NEST_CLOSE_64 NEST_CLOSE_63 ")"
+
 typedef struct {
     const char *expr;
     byte_t expected_raw[MAX_VALUE_SIZE];
@@ -27,6 +34,27 @@ typedef struct {
     intp_status_code_t expected_status;
     uint32_t expected_pos;
 } intp_error_testcase_t;
+
+typedef struct {
+    const char *expr;
+    bool expected_approximated;
+} intp_approx_testcase_t;
+
+// Encoders flag values whose immediate had to be rounded to the closest
+// encodable one; the flag survives raw concatenation
+const intp_approx_testcase_t _TESTS_APPROX[] = {
+    {"t2_mov(1, 2, 724)",                 false},
+    {"t2_mov(1, 2, 725)",                 true},
+    {"t2_mov(1, 2, t2_imm(725))",         false}, // explicit rounding is not flagged
+    {"a1_mov(0, 0, 0xF000000F)",          false},
+    {"a1_mov(0, 0, 0x12345678)",          true},
+    {"t2_vmov(1, 22.0)",                  false},
+    {"t2_vmov(1, 15.0 * (544 / 368.0))",  true},
+    {"nop . t2_mov(1, 2, 725)",           true},
+    {"t2_mov(1, 2, 725) . nop",           true},
+    {"nop . nop",                         false},
+    {"mov32(0, 0x12345678, 0)",           false},
+};
 
 const intp_testcase_t _TESTS[] = {
     // Numeric primitives
@@ -115,6 +143,15 @@ const intp_testcase_t _TESTS[] = {
     // Bitwise
     {"2 << 1",  {0x04}, INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
     {"16>>2",   {0x04}, INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
+    // '>>' is logical on unsigned values and arithmetic on signed ones
+    {"0x80000000 >> 4", {0x00, 0x00, 0x00, 0x08}, INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
+    {"-16 >> 2",        {0xFC, 0xFF, 0xFF, 0xFF}, INTP_PRIMITIVE_SIZE, DATA_TYPE_SIGNED},
+    {"-16 << 1",        {0xE0, 0xFF, 0xFF, 0xFF}, INTP_PRIMITIVE_SIZE, DATA_TYPE_SIGNED},
+    // Constants may be followed by an argument separator / closing bracket
+    {"max(pi, 1)",      {0xDB, 0x0F, 0x49, 0x40}, INTP_PRIMITIVE_SIZE, DATA_TYPE_FLOAT},
+    {"(pi)",            {0xDB, 0x0F, 0x49, 0x40}, INTP_PRIMITIVE_SIZE, DATA_TYPE_FLOAT},
+    // Deep (but bounded) nesting is fine
+    {NEST_OPEN_63 "1" NEST_CLOSE_63, {0x01}, INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
     {"6 & 2",   {0x02}, INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
     {"3 | 4",   {0x07}, INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
     {"255^0",   {0xFF}, INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
@@ -239,6 +276,24 @@ const intp_testcase_t _TESTS[] = {
     {"a1_imm(725)",               {0xD4, 0x02},             INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
     {"t2_mov(1, 2, t2_imm(725))", {0x5F, 0xF4, 0x35, 0x72}, 4, DATA_TYPE_RAW},
     {"a1_mov(0, 2, a1_imm(725))", {0xB5, 0x2F, 0xA0, 0xE3}, 4, DATA_TYPE_RAW},
+    // t2_imm()/a1_imm() return exactly encodable inputs unchanged
+    // (replicated Thumb forms, wrap-around ARM rotations)
+    {"t2_imm(0xFFFFFFFF)",        {0xFF, 0xFF, 0xFF, 0xFF},   INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
+    {"t2_imm(0x00FF00FF)",        {0xFF, 0x00, 0xFF, 0x00},   INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
+    {"a1_imm(0xF000000F)",        {0x0F, 0x00, 0x00, 0xF0},   INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
+    {"a1_imm(0xC0000003)",        {0x03, 0x00, 0x00, 0xC0},   INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
+    {"t2_mov(0, 1, 0xFFFFFFFF)",  {0x4F, 0xF0, 0xFF, 0x31},   4, DATA_TYPE_RAW},
+    {"a1_mov(0, 0, 0xF000000F)",  {0xFF, 0x02, 0xA0, 0xE3},   4, DATA_TYPE_RAW},
+    // Immediates without an exact encoding are rounded to the closest
+    // encodable value (as in v5), see _TESTS_APPROX for the flag
+    {"t2_mov(1, 1, 981)",                      {0x5F, 0xF4, 0x75, 0x71}, 4, DATA_TYPE_RAW}, // 980
+    {"a1_mov(0, 0, 0x12345678)",               {0x48, 0x05, 0xA0, 0xE3}, 4, DATA_TYPE_RAW}, // 0x12000000
+    {"t2_mov(1, 1, 960 * 10222 / 10000)",      {0x5F, 0xF4, 0x75, 0x71}, 4, DATA_TYPE_RAW},
+    {"t2_mov(1, 1, uint(960 * 1.0222f))",      {0x5F, 0xF4, 0x75, 0x71}, 4, DATA_TYPE_RAW},
+    {"t2_mov(1, 1, uint(960 * (736 / 720f)))", {0x5F, 0xF4, 0x75, 0x71}, 4, DATA_TYPE_RAW},
+#ifdef BUILD_LEGACY_SUPPORT
+    {"t2_mov(1,2,</,<*,960,10222>,10000>)",    {0x5F, 0xF4, 0x75, 0x72}, 4, DATA_TYPE_RAW},
+#endif
 
     // Mixed real world cases
     {"t1_movt(4, 725.0f >> 16)",                  {0xC4, 0xF2, 0x35, 0x44}, 4, DATA_TYPE_RAW},
@@ -386,24 +441,37 @@ const intp_error_testcase_t _TESTS_ERROR[] = {
     {"t1_mov(0, 256)",                         INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"t2_mov(2, 0, 1)",                        INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"t2_mov(1, 15, 1)",                       INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
-    {"t2_mov(1, 1, 981)",                      INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"t3_mov(15, 1)",                          INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"t3_mov(1, 65536)",                       INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"t1_movt(15, 1)",                         INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"a1_mov(2, 0, 1)",                        INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"a1_mov(1, 15, 1)",                       INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
-    {"a1_mov(0, 0, 0x12345678)",               INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"a2_mov(15, 1)",                          INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"t2_vmov(32, 1.0)",                       INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
-    {"t2_vmov(0, 1.1)",                        INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
+    {"t2_vmov(0, 100.0)",                      INTP_STATUS_ERROR_INVALID_DATATYPE, 0}, // outside VFP immediate range
+    {"t2_vmov(0, 0.0)",                        INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"mov32(15, 1, 0)",                        INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"t2_imm(DEADr)",                          INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
     {"a1_imm(DEADr)",                          INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
-    {"t2_mov(1, 1, 960 * 10222 / 10000)",      INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
-    {"t2_mov(1, 1, uint(960 * 1.0222f))",      INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
-    {"t2_mov(1, 1, uint(960 * (736 / 720f)))", INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
+
+    // Stray tokens after a value (missing '.' concatenation) are errors, not silently dropped
+    {"nop nop",             INTP_STATUS_ERROR_INVALID_TOKEN, 4},
+    {"uint32(1) uint32(2)", INTP_STATUS_ERROR_INVALID_TOKEN, 10},
+    {"pi e",                INTP_STATUS_ERROR_INVALID_TOKEN, 3},
+    {"pi)",                 INTP_STATUS_ERROR_INVALID_TOKEN, 2},
+
+    // Signed overflow
+    {"-2147483648 / -1",    INTP_STATUS_ERROR_INVALID_DATATYPE, 12},
+    {"-2147483648 % -1",    INTP_STATUS_ERROR_INVALID_DATATYPE, 12},
+
+    // Nesting depth limit
+    {NEST_OPEN_64 "1" NEST_CLOSE_64, INTP_STATUS_ERROR_NESTING_TOO_DEEP, 64},
+
 #ifdef BUILD_LEGACY_SUPPORT
-    {"t2_mov(1,2,</,<*,960,10222>,10000>)",    INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
+    // Legacy macros: division by zero and undefined shifts
+    {"uint32(</,1,0>)",     INTP_STATUS_ERROR_INVALID_DATATYPE, 7},
+    {"uint32(<l,1,32>)",    INTP_STATUS_ERROR_INVALID_DATATYPE, 7},
+    {"uint32(<r,1,32>)",    INTP_STATUS_ERROR_INVALID_DATATYPE, 7},
 #endif
 
     // VG
@@ -593,6 +661,7 @@ int main() {
     uint32_t tests_error_cnt = sizeof(_TESTS_ERROR) / sizeof(intp_error_testcase_t);
     uint32_t tests_unk_cnt = sizeof(_TESTS_UNK) / sizeof(intp_unk_testcase_t);
     uint32_t tests_vg_context_cnt = sizeof(_TESTS_VG_CONTEXT) / sizeof(intp_testcase_t);
+    uint32_t tests_approx_cnt = sizeof(_TESTS_APPROX) / sizeof(intp_approx_testcase_t);
 
     intp_status_t ret;
 
@@ -633,6 +702,24 @@ int main() {
         test_unk_assert(_TESTS_UNK[i], pos, &value, ret);
     }
 
+    for (int i = 0; i < tests_approx_cnt; i++) {
+        memset(&value, 0, sizeof(intp_value_t));
+        pos = 0;
+
+        ret = intp_evaluate(_TESTS_APPROX[i].expr, &pos, &value);
+        if (ret.code != INTP_STATUS_OK) {
+            printf("FAIL: '%s'\n", _TESTS_APPROX[i].expr);
+            printf("-  Expected status 0, got %d\n", ret.code);
+            g_failure_cnt++;
+        } else if (value.approximated != _TESTS_APPROX[i].expected_approximated) {
+            printf("FAIL: '%s'\n", _TESTS_APPROX[i].expr);
+            printf("-  Expected approximated=%d, got %d\n", _TESTS_APPROX[i].expected_approximated, value.approximated);
+            g_failure_cnt++;
+        } else {
+            g_success_cnt++;
+        }
+    }
+
     intp_vg_context_t context = {0};
     context.fb_width = 640;
     context.fb_height = 368;
@@ -655,7 +742,7 @@ int main() {
     }
 
     printf("\n");
-    printf("%d out of %d tests succeeded!\n", g_success_cnt, tests_cnt + tests_error_cnt + tests_unk_cnt + tests_vg_context_cnt);
+    printf("%d out of %d tests succeeded!\n", g_success_cnt, tests_cnt + tests_error_cnt + tests_unk_cnt + tests_vg_context_cnt + tests_approx_cnt);
     if (g_failure_cnt > 0)
         printf("%d tests failed!\n", g_failure_cnt);
     printf("\n");

@@ -71,6 +71,8 @@ const char *intp_status_code_to_string(intp_status_code_t code) {
             return "Missing closing bracket.";
         case INTP_STATUS_ERROR_VG_IB_OOB:
             return "Internal buffer index out of bounds.";
+        case INTP_STATUS_ERROR_NESTING_TOO_DEEP:
+            return "Expression is nested too deeply.";
         case INTP_STATUS_MAX:
         default:
             return "?";

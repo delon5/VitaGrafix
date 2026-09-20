@@ -14,6 +14,12 @@ static vg_config_section_t g_config_section = CONFIG_SECTION_NONE;
 static vg_config_t g_config = {0};
 static vg_io_status_t g_config_status = {0};
 
+// Incremented on every section header, so options can tell
+// whether they are being (re)defined by a new section
+static uint32_t g_config_section_id = 0;
+// Section that last defined the IB list
+static uint32_t g_config_ib_section_id = 0;
+
 #define CONFIG_PATH_SIZE 128
 
 const vg_res_t vg_config_framebuffer_resolutions[FRAMEBUFFER_RESOLUTION_COUNT] = {
@@ -211,15 +217,16 @@ static vg_io_status_t vg_config_parse_msaa(const char line[], int pos, vg_featur
         __ret_status(IO_OK, 0, 0);
     }
 
-    if (vg_config_token_matches(line, pos, "4")) {
+    // Both the bare number and the documented '4x' / '2x' / '1x' spellings
+    if (vg_config_token_matches(line, pos, "4") || vg_config_token_matches(line, pos, "4x")) {
         *msaa = MSAA_4X;
         __ret_status(IO_OK, 0, 0);
     }
-    if (vg_config_token_matches(line, pos, "2")) {
+    if (vg_config_token_matches(line, pos, "2") || vg_config_token_matches(line, pos, "2x")) {
         *msaa = MSAA_2X;
         __ret_status(IO_OK, 0, 0);
     }
-    if (vg_config_token_matches(line, pos, "1")) {
+    if (vg_config_token_matches(line, pos, "1") || vg_config_token_matches(line, pos, "1x")) {
         *msaa = MSAA_NONE;
         __ret_status(IO_OK, 0, 0);
     }
@@ -257,6 +264,12 @@ static vg_io_status_t vg_config_parse_option(const char line[]) {
                     return vg_config_parse_framebuffer_resolution(line, pos_rhs,
                             _OPTIONS[i].ft_state, _OPTIONS[i].res);
                 case CONFIG_OPTION_INTERNAL_BUFFER_RESOLUTION:
+                    // A new section replaces the IB list instead of appending to it,
+                    // otherwise [MAIN] IB + game IB would become a multi-res list
+                    if (g_config_ib_section_id != g_config_section_id) {
+                        *(_OPTIONS[i].count) = 0;
+                        g_config_ib_section_id = g_config_section_id;
+                    }
                     return vg_config_parse_internal_buffer_resolution(line, pos_rhs,
                             _OPTIONS[i].ft_state, _OPTIONS[i].res, _OPTIONS[i].count);
                 case CONFIG_OPTION_FRAMERATE:
@@ -275,6 +288,8 @@ static vg_io_status_t vg_config_parse_line(const char line[]) {
 
     // Check for a new section
     if (line[0] == '[') {
+        g_config_section_id++;
+
         // [MAIN]
         if (!strncasecmp(line, "[MAIN]", 6) && vg_io_is_line_end(line, 6)) {
             g_config_section = CONFIG_SECTION_MAIN;
@@ -357,17 +372,24 @@ vg_io_status_t vg_config_parse() {
     g_config.ib_enabled   = FT_UNSPECIFIED;
     g_config.fps_enabled  = FT_UNSPECIFIED;
     g_config.msaa_enabled = FT_UNSPECIFIED;
+    g_config.ib_count     = 0;
+    g_config_section_id    = 0;
+    g_config_ib_section_id = 0;
 
     char path[CONFIG_PATH_SIZE];
     snprintf(path, sizeof(path), "%s%s.txt", CONFIG_DIR, g_main.titleid);
 
-    // Prefer a complete title-specific configuration over config.txt
-    g_config_section = CONFIG_SECTION_NONE;
+    // Prefer a complete title-specific configuration over config.txt.
+    // The file is specific to this title, so options may be listed
+    // without a section header (they are treated as the game's section).
+    g_config_section = CONFIG_SECTION_GAME;
+    g_config_section_id = 1;
     g_config_status = vg_io_parse(path, vg_config_parse_line, false);
 
     // If does not exist, parse global config.txt
     if (g_config_status.code == IO_ERROR_OPEN_FAILED) {
         g_config_section = CONFIG_SECTION_NONE;
+        g_config_section_id = 0;
         g_config_status = vg_io_parse(CONFIG_PATH, vg_config_parse_line, true);
     }
 

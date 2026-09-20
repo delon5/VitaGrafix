@@ -21,12 +21,10 @@ void vg_log_prepare() {
 }
 
 void vg_log_flush() {
-    // logger has to be enabled before the first flush!
-    if (!g_log_enabled) {
-        g_log_buffer_size = 0;
-        memset(g_log_buffer, 0, LOG_BUFFER_SIZE);
+    // Messages logged before the logger is enabled (start-up header, config
+    // parsing) stay buffered so they reach log.txt once LOG=1 is known
+    if (!g_log_enabled)
         return;
-    }
 
     if (!g_log_buffer_size)
         return;
@@ -48,15 +46,19 @@ void vg_log_printf(const char *format, ...) {
 
     char buffer[256];
     vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
 
     size_t print_len = strlen(buffer);
     if (g_log_buffer_size + print_len >= LOG_BUFFER_SIZE)
         vg_log_flush(); // Flush buffer
 
-    strncpy(&g_log_buffer[g_log_buffer_size], buffer, print_len + 1);
-    g_log_buffer_size += print_len;
+    // Still no room (logger disabled, or log.txt could not be opened)?
+    // Drop this message instead of writing past the end of the buffer.
+    if (g_log_buffer_size + print_len >= LOG_BUFFER_SIZE)
+        return;
 
-    va_end(args);
+    memcpy(&g_log_buffer[g_log_buffer_size], buffer, print_len + 1);
+    g_log_buffer_size += print_len;
 }
 
 void vg_log_read(char *dest, int size) {

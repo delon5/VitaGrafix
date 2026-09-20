@@ -76,6 +76,41 @@ static bool op_encode_find_vfp_imm(uint32_t value, uint8_t *encoded_imm8) {
     return false;
 }
 
+/*
+ * Find the VFP immediate encoding of an IEEE-754 single.
+ * Prefers the exact encoding; otherwise picks the closest representable
+ * value (reported via *exact) as long as the magnitude is inside the
+ * representable range (0.125 .. 31.0). Out-of-range values cannot be encoded.
+ */
+static bool op_encode_vfp_imm(uint32_t value, uint8_t *encoded_imm8, bool *exact) {
+    *exact = op_encode_find_vfp_imm(value, encoded_imm8);
+    if (*exact)
+        return true;
+
+    float wanted;
+    memcpy(&wanted, &value, sizeof(wanted));
+    float magnitude = wanted < 0.0f ? -wanted : wanted;
+    if (!(magnitude >= 0.125f && magnitude <= 31.0f))
+        return false;
+
+    float best_error = 0.0f;
+    bool found = false;
+    for (uint16_t candidate = 0; candidate < 0x100; candidate++) {
+        uint32_t bits = op_encode_vfp_expand_imm(candidate);
+        float expanded;
+        memcpy(&expanded, &bits, sizeof(expanded));
+        float error = expanded - wanted;
+        if (error < 0.0f)
+            error = -error;
+        if (!found || error < best_error) {
+            best_error = error;
+            *encoded_imm8 = candidate;
+            found = true;
+        }
+    }
+    return found;
+}
+
 static uint16_t op_encode_approx_thumb_imm(uint32_t value) {
     if (value < 256)
         return value;
@@ -104,11 +139,42 @@ static uint16_t op_encode_approx_arm_imm(uint32_t value) {
     return (value >> rotation) | (((32 - rotation) / 2) << 8);
 }
 
+/*
+ * Find the Thumb-2 modified immediate encoding of value.
+ * Prefers the exact encoding; falls back to the closest representable value
+ * (and reports that via *exact) when none exists.
+ */
+static uint16_t op_encode_thumb_imm(uint32_t value, bool *exact) {
+    uint16_t imm12;
+    *exact = op_encode_find_thumb_imm(value, &imm12);
+    if (!*exact)
+        imm12 = op_encode_approx_thumb_imm(value);
+    return imm12;
+}
+
+/*
+ * Find the ARM (A1) modified immediate encoding of value.
+ * Prefers the exact encoding; falls back to the closest representable value
+ * (and reports that via *exact) when none exists.
+ */
+static uint16_t op_encode_arm_imm(uint32_t value, bool *exact) {
+    uint16_t imm12;
+    *exact = op_encode_find_arm_imm(value, &imm12);
+    if (!*exact)
+        imm12 = op_encode_approx_arm_imm(value);
+    return imm12;
+}
+
+static uint32_t op_encode_arm_expand_imm(uint16_t imm12) {
+    return op_encode_ror(imm12 & 0xFF, ((imm12 >> 8) & 0xF) * 2);
+}
+
 bool op_encode_t2_imm(value_t *out) {
     if (!op_encode_is_scalar_bits(out, UINT32_MAX))
         return false;
 
-    out->data.uint32 = op_encode_thumb_expand_imm(op_encode_approx_thumb_imm(out->data.uint32));
+    bool exact;
+    out->data.uint32 = op_encode_thumb_expand_imm(op_encode_thumb_imm(out->data.uint32, &exact));
     out->type = DATA_TYPE_UNSIGNED;
     out->size = 4;
     return true;
@@ -118,8 +184,8 @@ bool op_encode_a1_imm(value_t *out) {
     if (!op_encode_is_scalar_bits(out, UINT32_MAX))
         return false;
 
-    uint16_t imm12 = op_encode_approx_arm_imm(out->data.uint32);
-    out->data.uint32 = op_encode_ror(imm12 & 0xFF, ((imm12 >> 8) & 0xF) * 2);
+    bool exact;
+    out->data.uint32 = op_encode_arm_expand_imm(op_encode_arm_imm(out->data.uint32, &exact));
     out->type = DATA_TYPE_UNSIGNED;
     out->size = 4;
     return true;
@@ -166,12 +232,12 @@ bool op_encode_t2_mov(value_t *out, value_t *reg, value_t *value) {
         return false;
 
     bool setflags = out->data.uint32 != 0;
-    uint16_t encoded_imm12;
-    if (!op_encode_find_thumb_imm(value->data.uint32, &encoded_imm12))
-        return false;
+    bool exact;
+    uint16_t encoded_imm12 = op_encode_thumb_imm(value->data.uint32, &exact);
 
     memset(out->data.raw, 0, 4);
     value_raw(out, 4);
+    out->approximated = !exact;
 
 
     out->data.raw[1] |= 0b11110000;       // Data processing (12-bit)
@@ -258,11 +324,13 @@ bool op_encode_t2_vmov_f32(value_t *out, value_t *value) {
 
     uint8_t reg = (uint8_t)out->data.uint32;
     uint8_t encoded_imm8;
-    if (!op_encode_find_vfp_imm(value->data.uint32, &encoded_imm8))
+    bool exact;
+    if (!op_encode_vfp_imm(value->data.uint32, &encoded_imm8, &exact))
         return false;
 
     memset(out->data.raw, 0, 4);
     value_raw(out, 4);
+    out->approximated = !exact;
 
     out->data.raw[1] |= 0b11101110; // Condition + OP
     out->data.raw[0] |= 0b10110000; // OP
@@ -296,12 +364,12 @@ bool op_encode_a1_mov(value_t *out, value_t *reg, value_t *value) {
         return false;
 
     bool setflags = out->data.uint32 != 0;
-    uint16_t encoded_imm12;
-    if (!op_encode_find_arm_imm(value->data.uint32, &encoded_imm12))
-        return false;
+    bool exact;
+    uint16_t encoded_imm12 = op_encode_arm_imm(value->data.uint32, &exact);
 
     memset(out->data.raw, 0, 4);
     value_raw(out, 4);
+    out->approximated = !exact;
 
     out->data.raw[3] |= 0b11100000;     // Condition
     out->data.raw[3] |= 0b00000010;     // Immediate value

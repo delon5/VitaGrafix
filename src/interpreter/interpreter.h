@@ -51,6 +51,10 @@ typedef struct {
     byte_t size;
 
     bool unk[MAX_VALUE_SIZE];
+
+    // set when an encoder could not represent the requested immediate exactly
+    // and emitted the closest encodable value instead
+    bool approximated;
 } intp_value_t;
 
 typedef enum {
@@ -69,6 +73,8 @@ typedef enum {
     INTP_STATUS_ERROR_MISSING_CLOSE_BRACKET,
 
     INTP_STATUS_ERROR_VG_IB_OOB,
+
+    INTP_STATUS_ERROR_NESTING_TOO_DEEP,
 
     INTP_STATUS_MAX
 } intp_status_code_t;

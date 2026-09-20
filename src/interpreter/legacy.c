@@ -142,16 +142,25 @@ intp_status_t legacy_parse_gen_value(const char chunk[], int pos, int end, uint3
                 *value = a - b;
             else if (chunk[pos + 1] == '*')
                 *value = a * b;
-            else if (chunk[pos + 1] == '/')
+            else if (chunk[pos + 1] == '/') {
+                if (b == 0) // division by zero
+                    __intp_ret_status(INTP_STATUS_ERROR_INVALID_DATATYPE, pos);
                 *value = a / b;
+            }
             else if (chunk[pos + 1] == '&')
                 *value = a & b;
             else if (chunk[pos + 1] == '|')
                 *value = a | b;
-            else if (tolower(chunk[pos + 1]) == 'l')
+            else if (tolower(chunk[pos + 1]) == 'l') {
+                if (b >= 32) // undefined shift
+                    __intp_ret_status(INTP_STATUS_ERROR_INVALID_DATATYPE, pos);
                 *value = a << b;
-            else if (tolower(chunk[pos + 1]) == 'r')
+            }
+            else if (tolower(chunk[pos + 1]) == 'r') {
+                if (b >= 32) // undefined shift
+                    __intp_ret_status(INTP_STATUS_ERROR_INVALID_DATATYPE, pos);
                 *value = a >> b;
+            }
             else if (tolower(chunk[pos + 1]) == 'm' && tolower(chunk[pos + 3]) == 'n')
                 *value = a < b ? a : b;
             else if (tolower(chunk[pos + 1]) == 'm' && tolower(chunk[pos + 3]) == 'x')

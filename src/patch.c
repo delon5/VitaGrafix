@@ -67,7 +67,9 @@ static void vg_patch_set_interpreter_context() {
 
     // SCE_GXM_MULTISAMPLE_*
     context.msaa = config->msaa == MSAA_4X ? 2 : config->msaa == MSAA_2X ? 1 : 0;
-    context.msaa_enabled = context.msaa > 0;
+    // Legacy <msaa_enabled> reflects the MSAA feature switch (MSAA != OFF),
+    // not the selected level; MSAA=1x is enabled with no multisampling
+    context.msaa_enabled = config->msaa_enabled == FT_ENABLED;
 
     intp_set_vg_context(&context);
 }
@@ -154,6 +156,12 @@ static vg_io_status_t vg_patch_parse_patch(const char line[]) {
         vg_log_printf("%s\n", buf);
 
         __ret_status(IO_ERROR_INTERPRETER_ERROR, 0, intp_ret.pos);
+    }
+
+    // An immediate that has no exact ARM/Thumb encoding was rounded to the
+    // closest encodable value; keep going (as previous releases did) but say so
+    if (patch_data.approximated) {
+        vg_log_printf("[PATCH] WARNING: immediate has no exact encoding and was rounded in: %s\n", line);
     }
 
     for (byte_t i = 0; i < patch_data.size; i++) {
@@ -332,10 +340,11 @@ vg_io_status_t vg_patch_parse_and_apply() {
         g_patch_status = vg_io_parse(path, vg_patch_parse_line, false);
     }
 
-    // Doesn't exist? Read patchlist.txt
+    // Doesn't exist? Read patchlist.txt (created empty if missing, like config.txt,
+    // so a fresh install is a silent no-op rather than a permanent OSD error)
     if (g_patch_status.code == IO_ERROR_OPEN_FAILED) {
         snprintf(path, 128, "%s", PATCH_LIST_PATH);
-        g_patch_status = vg_io_parse(path, vg_patch_parse_line, false);
+        g_patch_status = vg_io_parse(path, vg_patch_parse_line, true);
     }
 
     // Read alternative patch file if directed to

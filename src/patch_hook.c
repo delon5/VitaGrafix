@@ -25,6 +25,14 @@ int vg_hook_sceCtrlReadBufferPositive2_peekPatched(int port, SceCtrlData *pad_da
 }
 
 static vg_io_status_t vg_hook_function_import(vg_hook_id_t hook_id, uint32_t nid, const void *func) {
+    // Each hook has exactly one slot. Hooking the same import twice would
+    // overwrite the first hook's uid/ref (leaking it, and making its
+    // TAI_CONTINUE re-enter the hook forever), so treat a repeat as a no-op.
+    if (g_main.hook[hook_id] >= 0) {
+        vg_log_printf("[HOOK] Function import nid=0x%X is already hooked, skipping\n", nid);
+        __ret_status(IO_OK, 0, 0);
+    }
+
     vg_log_printf("[HOOK] Hooking function import nid=0x%X to 0x%X\n", nid, func);
 
     g_main.hook[hook_id] = taiHookFunctionImport(&g_main.hook_ref[hook_id], TAI_MAIN_MODULE, TAI_ANY_LIBRARY, nid, func);

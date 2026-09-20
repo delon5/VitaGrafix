@@ -18,6 +18,10 @@
 #define OP_TERNARY(fn)    {.ternary = (fn)}
 #define OP_QUATERNARY(fn) {.quaternary = (fn)}
 
+// Maximum nesting depth of brackets / function calls in a single expression
+#define MAX_PARSE_DEPTH 64
+static int g_parse_depth = 0;
+
 #define TOKEN(type) &_TOKENS[type]
 const token_t _TOKENS[TOKEN_INVALID + 1] = {
     {90, NULL,        TOKEN_PRIMITIVE,             0,              OP_NONE},
@@ -455,6 +459,37 @@ intp_status_t peek_token(const char *expr, uint32_t pos, value_t *value, const t
 }
 
 /**
+ * @brief Check that whatever follows an evaluated value may legally follow it:
+ *         end of expression, an infix operator, an argument separator,
+ *         the terminator, or ')' when allow_brckt_next is set.
+ *         Anything else (e.g. 'nop nop' with a missing '.') is an error
+ *         instead of being silently ignored.
+ *
+ * @param expr             given expression
+ * @param pos              position right after the value
+ * @param allow_brckt_next allow closing bracket ')' after the value
+ *
+ * @return status
+ */
+static intp_status_t check_value_end(const char *expr, uint32_t pos, bool allow_brckt_next) {
+    const token_t *token;
+    intp_status_t ret = peek_token(expr, pos, NULL, &token, false, false);
+    if (ret.code != INTP_STATUS_OK)
+        return ret;
+
+    if (token->type != TOKEN_INVALID
+            && !(token->flags & TOKEN_INFIX)
+            && token->type != TOKEN_ARGUMENT_SEP
+            && token->type != TOKEN_TERMINATOR
+            && (!allow_brckt_next || token->type != TOKEN_BRACKET_CLOSE)) {
+        skip_ws(expr, &pos); // point at the offending token
+        __intp_ret_status(INTP_STATUS_ERROR_INVALID_TOKEN, pos);
+    }
+
+    __intp_ret_status(INTP_STATUS_OK, pos);
+}
+
+/**
  * @brief Parse and evaluate single function call or constant
  *
  * @param expr             given expression
@@ -504,13 +539,6 @@ intp_status_t parse_call(const char *expr, uint32_t *pos, value_t *value, bool a
             if (token->type != TOKEN_BRACKET_CLOSE)
                 __intp_ret_status(INTP_STATUS_ERROR_TOO_MANY_ARGS, pos_error);
         }
-#else
-        // Don't allow 'pi)'
-        if (token->type != TOKEN_INVALID
-                && token->type != TOKEN_TERMINATOR
-                && !(token->flags & TOKEN_INFIX)
-                && (!allow_brckt_next || token->type != TOKEN_BRACKET_CLOSE))
-            __intp_ret_status(INTP_STATUS_ERROR_INVALID_TOKEN, *pos);
 #endif
     }
 
@@ -596,7 +624,8 @@ intp_status_t parse_call(const char *expr, uint32_t *pos, value_t *value, bool a
             __intp_ret_status(INTP_STATUS_ERROR_INVALID_DATATYPE, pos_fn_begin);
     }
 
-    __intp_ret_status(INTP_STATUS_OK, *pos);
+    // Don't allow 'pi)' or 'nop nop'
+    return check_value_end(expr, *pos, allow_brckt_next);
 }
 
 /**
@@ -794,12 +823,21 @@ intp_status_t parse_expression(const char *expr, uint32_t *pos, value_t *value, 
 
     //printf("DEBUG: parse_expression(): Raw?: %d\n", force_raw);
 
+    // Every nested bracket / function argument recurses through here,
+    // bound the depth so a pathological line cannot exhaust the stack
+    if (g_parse_depth >= MAX_PARSE_DEPTH) {
+        skip_ws(expr, pos);
+        __intp_ret_status(INTP_STATUS_ERROR_NESTING_TOO_DEEP, *pos);
+    }
+    g_parse_depth++;
+
     // Parse LHS
     ret = parse_value(expr, pos, value, force_raw, allow_brckt_next);
-    if (ret.code != INTP_STATUS_OK)
-        return ret;
 
     // Go!
-    ret = parse_subtree(expr, pos, value, 0);
+    if (ret.code == INTP_STATUS_OK)
+        ret = parse_subtree(expr, pos, value, 0);
+
+    g_parse_depth--;
     return ret;
 }

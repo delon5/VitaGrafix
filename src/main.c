@@ -52,6 +52,11 @@ static int vg_main_get_osd_width() {
 }
 
 static int sceDisplaySetFrameBuf_patched(const SceDisplayFrameBuf *pParam, int sync) {
+    // NULL (or a NULL base) is a legal call that blanks the display;
+    // there is nothing to draw the OSD onto
+    if (pParam == NULL || pParam->base == NULL)
+        return TAI_CONTINUE(int, g_main.osd_hook_ref, pParam, sync);
+
     const vg_config_t config = *vg_config_get();
     const vg_io_status_t config_status = *vg_config_get_status();
     const vg_io_status_t patch_status = *vg_patch_get_status();
@@ -132,7 +137,7 @@ static int sceDisplaySetFrameBuf_patched(const SceDisplayFrameBuf *pParam, int s
         // 2nd line
         if (config.fps_enabled == FT_ENABLED) {
             osd_draw_stringf(110, y, "%d FPS",
-                    config.fps == FPS_60 ? 60 : 30);
+                    config.fps == FPS_60 ? 60 : (config.fps == FPS_30 ? 30 : 20));
             y -= 20;
         } else if (config.fps_enabled != FT_UNSUPPORTED) {
             osd_draw_stringf(110, y, "FPS: default");
