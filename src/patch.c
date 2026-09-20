@@ -340,11 +340,20 @@ vg_io_status_t vg_patch_parse_and_apply() {
         g_patch_status = vg_io_parse(path, vg_patch_parse_line, false);
     }
 
-    // Doesn't exist? Read patchlist.txt (created empty if missing, like config.txt,
-    // so a fresh install is a silent no-op rather than a permanent OSD error)
+    // Doesn't exist? Read the legacy patchlist.txt
     if (g_patch_status.code == IO_ERROR_OPEN_FAILED) {
         snprintf(path, 128, "%s", PATCH_LIST_PATH);
-        g_patch_status = vg_io_parse(path, vg_patch_parse_line, true);
+        g_patch_status = vg_io_parse(path, vg_patch_parse_line, false);
+
+        // No patch file of any kind: the title is simply not supported.
+        // Nothing is created (an empty patchlist.txt would only confuse), and
+        // no error is reported, so unsupported games get no OSD.
+        if (g_patch_status.code == IO_ERROR_OPEN_FAILED) {
+            vg_log_printf("[PATCH] No patch file for this title (looked in %s%.4s/, %s and %s)\n",
+                    PATCH_DIR, g_main.titleid, PATCH_DIR, PATCH_LIST_PATH);
+            g_patch_status.code = IO_OK;
+            g_main.patch_match = MODULE_TITLE_MISMATCH;
+        }
     }
 
     // Read alternative patch file if directed to

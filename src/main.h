@@ -38,6 +38,7 @@ typedef enum {
 
 typedef struct {
     // OSD hook
+    bool osd_done;
     SceUID osd_hook;
     tai_hook_ref_t osd_hook_ref;
     SceUInt32 osd_timer;

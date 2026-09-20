@@ -65,15 +65,15 @@ static int sceDisplaySetFrameBuf_patched(const SceDisplayFrameBuf *pParam, int s
     if (!g_main.osd_timer) {
         g_main.osd_timer = sceKernelGetProcessTimeLow();
     }
-    // OSD timer finished? Release the hook
-    else if (sceKernelGetProcessTimeLow() - g_main.osd_timer > OSD_SHOW_DURATION
+    // OSD timer finished? Stop drawing. The hook itself stays installed until
+    // module_stop: unhooking from inside the call chain is not safe when another
+    // plugin has hooked the same import (their chain would point at freed memory)
+    else if (g_main.osd_done
+            || (sceKernelGetProcessTimeLow() - g_main.osd_timer > OSD_SHOW_DURATION
             && config_status.code == IO_OK // Show indefinitely on i/o error
-            && patch_status.code == IO_OK) {
-        int ret = TAI_CONTINUE(int, g_main.osd_hook_ref, pParam, sync);
-
-        taiHookRelease(g_main.osd_hook, g_main.osd_hook_ref);
-        g_main.osd_hook = -1;
-        return ret;
+            && patch_status.code == IO_OK)) {
+        g_main.osd_done = true;
+        return TAI_CONTINUE(int, g_main.osd_hook_ref, pParam, sync);
     }
 
     osd_update_fb(pParam);
@@ -252,6 +252,15 @@ int module_start(SceSize argc, const void *args) {
                     config_status.line, config_status.pos_line, vg_io_status_code_to_string(config_status.code));
     }
 
+    // Effective configuration, so a log always shows what was requested
+    vg_log_printf("[CONFIG] ENABLED=%d OSD=%d FB=%d:%dx%d IB=%d:%d#%dx%d..%dx%d FPS=%d:%d MSAA=%d:%d\n",
+                config->enabled, config->osd_enabled,
+                config->fb_enabled, config->fb.width, config->fb.height,
+                config->ib_enabled, config->ib_count, config->ib[0].width, config->ib[0].height,
+                config->ib[config->ib_count > 0 ? config->ib_count - 1 : 0].width,
+                config->ib[config->ib_count > 0 ? config->ib_count - 1 : 0].height,
+                config->fps_enabled, config->fps, config->msaa_enabled, config->msaa);
+
     // Exit now?
     if (config->enabled == FT_DISABLED)
         goto EXIT;
@@ -283,6 +292,8 @@ EXIT_HOOK_OSD:
                     TAI_ANY_LIBRARY,
                     0x7A410B64,
                     sceDisplaySetFrameBuf_patched);
+        g_main.osd_done = false;
+        vg_log_printf("[MAIN] OSD hook on sceDisplaySetFrameBuf: 0x%X (match=%d)\n", g_main.osd_hook, g_main.patch_match);
 
         if (config_status.code != IO_OK || patch_status.code != IO_OK) {
             vg_log_read(g_osd_buffer, STRING_BUFFER_SIZE);
