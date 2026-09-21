@@ -348,7 +348,8 @@ static bool check_hook_directive(unsigned int line_number, const char *line,
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <patchlist.txt> [--fb WIDTHxHEIGHT|off] [--ib WIDTHxHEIGHT[,WIDTHxHEIGHT...]|off] [--fps 20|30|60] [--msaa 0|1|2] [--seg INDEX:SIZE]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <patchlist.txt> [--fb WIDTHxHEIGHT|off] [--ib WIDTHxHEIGHT[,WIDTHxHEIGHT...]|off] [--fps 20|30|60] [--msaa 0|1|2] [--seg INDEX:SIZE]\n"
+                "Set VG_LOG in the environment to print the plugin's own log alongside the report.\n", argv[0]);
         return 2;
     }
 

@@ -113,3 +113,38 @@ explicit refusal for such a target instead of a corrupted call.
 * A skipped call returns without continuing the taiHEN chain - that is the
   point of the directive, but it means another plugin's hook on the same game
   address would not run for a skipped call.
+
+## Checking a directive before it ships
+
+`tests/test_patchlist` parses and installs every `>` line of a patch file with
+the plugin's own parser (`src/patch_hook.c`, built against the stub
+`vitasdk`/`taihen` headers in `tests/stubs`), so a directive is checked by the
+code that will run it rather than by a second parser that can disagree with it.
+Each one is reported with the arguments it resolved to at the configuration
+being checked:
+
+```
+$ tests/test_patchlist patch/PCSG/PCSG00490.txt --fps 60 --seg 0:0x21B3F0
+00121 HOOK OK rateDivide 0:000ECC38 divisor=2 ret=0x1 thumb call args=4 install=yes
+```
+
+`install=no` means the configuration resolves the directive to something the
+plugin does not install - a divisor of 1, or an import hook that belongs to
+another frame rate setting. A directive that would fail on hardware is reported
+as an error with the plugin's own status, and the tool exits non-zero:
+
+```
+00121 HOOK ERR 12 23 Rate divisor out of range, allowed: 1..16 | >rateDivide(0:0xECC38, fps_limit / 30, ret=1)
+```
+
+`--seg <index>:<size>` passes the module's segment sizes (VGDump's `info.txt`
+prints them), which is what lets the target check refuse an offset that is past
+the end of its segment or not on an instruction boundary. `VG_LOG=1` in the
+environment prints the plugin's own log alongside the report.
+
+Run the directives against every frame rate setting, not just the one the patch
+was written for: a divisor that collapses to 0, a conflicting pair of lines and
+a full slot pool are all decided by the configuration.
+`tests/test_patchlist_directives.sh` freezes the expected report for
+`tests/patchlist_directives.txt`, which holds one example of every form and
+every refusal.
