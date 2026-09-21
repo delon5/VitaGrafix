@@ -15,8 +15,8 @@
 // RATE_DIVISOR_MAX lives in main.h, next to the slot pool size, because
 // src/io.c renders it into the error string for a divisor out of range.
 
-// RATE_COUNT_MODULUS and RATE_STALL_SKIPS live in main.h as well, with the
-// slot fields they belong to.
+// RATE_COUNT_MODULUS, RATE_STALL_CALLS and RATE_REENTRY_MAX live in main.h as
+// well, with the slot fields they belong to.
 
 // Arguments carried through the wrapper: r0-r3, and nothing else (see the ABI
 // note on vg_hook_rate_divide_call)
