@@ -29,6 +29,12 @@ const char *vg_io_status_code_to_string(vg_io_status_code_t code) {
         case IO_ERROR_TOO_MANY_PATCHES: return "Too many patches, limit: " TOSTRING(MAX_INJECT_NUM);
         case IO_ERROR_TAI_PATCH_EXISTS: return "Memory already patched.";
         case IO_ERROR_TAI_GENERIC: return "Unknown TAI error.";
+        case IO_ERROR_TOO_MANY_HOOKS: return "Too many hooked functions, limit: " TOSTRING(MAX_RATE_HOOK_NUM);
+        case IO_ERROR_HOOK_WRONG_FEATURE: return "Hook directive outside of @FPS.";
+        case IO_ERROR_HOOK_CONFLICT: return "Conflicting hook directives for one address.";
+        case IO_ERROR_HOOK_BAD_DIVISOR: return "Rate divisor out of range, max: " TOSTRING(RATE_DIVISOR_MAX);
+        case IO_ERROR_HOOK_BAD_TARGET: return "Hook target is not inside the module.";
+        case IO_ERROR_HOOK_UNSUPPORTED_ABI: return "Hook target ABI is not supported.";
         default: return "?";
     }
 }

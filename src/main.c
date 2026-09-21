@@ -221,6 +221,7 @@ int module_start(SceSize argc, const void *args) {
     g_main.frame = 0;
     for (int i = 0; i < MAX_RATE_HOOK_NUM; i++) {
         g_main.rate_hook[i].uid = -1;
+        g_main.rate_hook[i].armed = false;
         g_main.rate_hook[i].divisor = 0;
     }
 
@@ -324,8 +325,17 @@ int module_stop(SceSize argc, const void *args) {
     }
     g_main.inject_num = 0;
 
-    // Release rate divided game function hooks before the frame counter they
-    // read from, which lives in the hook[] array below
+    // Release rate divided game function hooks before the frame counter some
+    // of them read from, which lives in the hook[] array below.
+    //
+    // Disarm every slot first: a thread that is already inside a wrapper then
+    // takes the skipped path (which touches nothing that is being freed)
+    // instead of following a chain through a released ref. The window is the
+    // same one the OSD hook documents above and cannot be closed from here,
+    // but nothing is left pointing at freed memory on purpose.
+    for (uint32_t i = 0; i < g_main.rate_hook_num; i++) {
+        __atomic_store_n(&g_main.rate_hook[i].armed, false, __ATOMIC_RELEASE);
+    }
     for (uint32_t i = g_main.rate_hook_num; i > 0; i--) {
         if (g_main.rate_hook[i - 1].uid >= 0) {
             taiHookRelease(g_main.rate_hook[i - 1].uid, g_main.rate_hook[i - 1].ref);

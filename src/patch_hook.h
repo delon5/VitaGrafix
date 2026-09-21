@@ -6,13 +6,13 @@ typedef enum {
     HOOK_CTRL_READ_BUFFER_POSITIVE,
     HOOK_CTRL_READ_BUFFER_POSITIVE2,
 
-    // Counts displayed frames for the '>rateDivide()' hooks. Installed only
-    // when the first rate divided hook is installed.
+    // Counts displayed frames for the '>rateDivide()' hooks that asked to be
+    // counted in frames. Installed only when the first such hook is.
     HOOK_RATE_FRAME_COUNTER
 } vg_hook_id_t;
 
 int sceCtrlPeekBufferPositive2(int port, SceCtrlData *pad_data, int count);
 
-vg_io_status_t vg_hook_parse_patch(const char line[]);
+vg_io_status_t vg_hook_parse_patch(const char line[], vg_feature_t feature);
 
 #endif

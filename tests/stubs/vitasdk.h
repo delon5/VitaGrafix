@@ -13,7 +13,22 @@ typedef int SceUID;
 typedef uint32_t SceUInt32;
 typedef uint32_t SceSize;
 
-typedef struct { SceSize size; char path[256]; } SceKernelModuleInfo;
+// Layout trimmed to what the plugin reads, field names and meaning as in
+// <psp2/kernel/modulemgr.h>
+typedef struct SceKernelSegmentInfo {
+    SceSize size;
+    SceUInt32 perms;
+    void *vaddr;
+    SceSize memsz;
+    SceSize filesz;
+    SceUInt32 res;
+} SceKernelSegmentInfo;
+
+typedef struct {
+    SceSize size;
+    char path[256];
+    SceKernelSegmentInfo segments[4];
+} SceKernelModuleInfo;
 
 typedef struct SceDisplayFrameBuf {
     SceSize size;

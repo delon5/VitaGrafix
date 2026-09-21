@@ -267,7 +267,7 @@ static vg_io_status_t vg_patch_parse_line(const char line[]) {
 
             // Parse hook
             if (line[0] == '>') {
-                return vg_hook_parse_patch(line);
+                return vg_hook_parse_patch(line, g_patch_feature);
             }
 
 #ifdef BUILD_SIG_SUPPORT

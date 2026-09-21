@@ -31,6 +31,14 @@ typedef enum {
     IO_ERROR_TAI_PATCH_EXISTS,
     IO_ERROR_TAI_GENERIC,
 
+    // Hook directive error
+    IO_ERROR_TOO_MANY_HOOKS,
+    IO_ERROR_HOOK_WRONG_FEATURE,
+    IO_ERROR_HOOK_CONFLICT,
+    IO_ERROR_HOOK_BAD_DIVISOR,
+    IO_ERROR_HOOK_BAD_TARGET,
+    IO_ERROR_HOOK_UNSUPPORTED_ABI,
+
     // Patcher directive
     IO_DIRECTIVE_ALTE_FILE
 } vg_io_status_code_t;
