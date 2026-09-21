@@ -12,6 +12,8 @@ static intp_vg_context_t g_vg_context = {
     .vblank = 1,
     .fps_limit = 60,
     .msaa = 2,
+    .fb_enabled = true,
+    .ib_enabled = true,
     .msaa_enabled = true
 };
 

@@ -331,12 +331,22 @@ void vg_config_set_unspecified_to_defaults() {
 
     if (g_config.fb_enabled == FT_UNSPECIFIED) {
         g_config.fb_enabled = FT_DISABLED;
-        g_config.fb.width = 960;
-        g_config.fb.height = 544;
     }
 
     if (g_config.ib_enabled == FT_UNSPECIFIED) {
         g_config.ib_enabled = FT_DISABLED;
+    }
+
+    // A disabled resolution option still has to evaluate to the native size:
+    // patches reference fb_w/ib_w from other option blocks, and an explicit
+    // "FB = off" would otherwise leave the zero-initialised 0x0 behind.
+    if (g_config.fb_enabled != FT_ENABLED || g_config.fb.width == 0 || g_config.fb.height == 0) {
+        g_config.fb.width = 960;
+        g_config.fb.height = 544;
+    }
+
+    if (g_config.ib_enabled != FT_ENABLED || g_config.ib_count == 0
+            || g_config.ib[0].width == 0 || g_config.ib[0].height == 0) {
         g_config.ib[0].width = 960;
         g_config.ib[0].height = 544;
         g_config.ib_count = 1;

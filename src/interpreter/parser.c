@@ -96,6 +96,8 @@ const token_t _TOKENS[TOKEN_INVALID + 1] = {
     {90, "vblank",    TOKEN_VG_CONFIG_VBLANK,      TOKEN_CONSTANT, OP_UNARY(op_vg_config_vblank)},
     {90, "fps_limit", TOKEN_VG_CONFIG_FPS_LIMIT,   TOKEN_CONSTANT, OP_UNARY(op_vg_config_fps_limit)},
     {90, "msaa",      TOKEN_VG_CONFIG_MSAA,        TOKEN_CONSTANT, OP_UNARY(op_vg_config_msaa)},
+    {90, "fb_enabled",TOKEN_VG_CONFIG_FB_ENABLED,  TOKEN_CONSTANT, OP_UNARY(op_vg_config_fb_enabled)},
+    {90, "ib_enabled",TOKEN_VG_CONFIG_IB_ENABLED,  TOKEN_CONSTANT, OP_UNARY(op_vg_config_ib_enabled)},
 
     {52, "mov32",     TOKEN_ENCODE_MOV32,          TOKEN_ARITY_3,  OP_TERNARY(op_encode_mov32)},
     {52, "t2_vmov",   TOKEN_ENCODE_T2_VMOV_F32,    TOKEN_ARITY_2,  OP_BINARY(op_encode_t2_vmov_f32)},

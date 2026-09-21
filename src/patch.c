@@ -65,6 +65,9 @@ static void vg_patch_set_interpreter_context() {
             break;
     }
 
+    context.fb_enabled = config->fb_enabled == FT_ENABLED;
+    context.ib_enabled = config->ib_enabled == FT_ENABLED;
+
     // SCE_GXM_MULTISAMPLE_*
     context.msaa = config->msaa == MSAA_4X ? 2 : config->msaa == MSAA_2X ? 1 : 0;
     // Legacy <msaa_enabled> reflects the MSAA feature switch (MSAA != OFF),

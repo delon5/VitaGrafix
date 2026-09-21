@@ -136,7 +136,7 @@ static void write_result(unsigned int line_number, uint8_t segment,
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <patchlist.txt> [--fb WIDTHxHEIGHT] [--ib WIDTHxHEIGHT[,WIDTHxHEIGHT...]] [--fps 20|30|60] [--msaa 0|1|2]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <patchlist.txt> [--fb WIDTHxHEIGHT|off] [--ib WIDTHxHEIGHT[,WIDTHxHEIGHT...]|off] [--fps 20|30|60] [--msaa 0|1|2]\n", argv[0]);
         return 2;
     }
 
@@ -150,6 +150,8 @@ int main(int argc, char *argv[]) {
     context.vblank = 1;
     context.fps_limit = 60;
     context.msaa = 2;
+    context.fb_enabled = true;
+    context.ib_enabled = true;
     context.msaa_enabled = true;
 
     for (int i = 2; i < argc; i += 2) {
@@ -159,14 +161,27 @@ int main(int argc, char *argv[]) {
         }
 
         if (!strcmp(argv[i], "--fb")) {
-            const char *end;
-            if (!parse_resolution(argv[i + 1], &end, &context.fb_width, &context.fb_height)
-                    || *end != '\0') {
-                fprintf(stderr, "Invalid framebuffer resolution: %s\n", argv[i + 1]);
-                return 2;
+            // A disabled option still evaluates to the native size, as the plugin does
+            if (!strcmp(argv[i + 1], "off")) {
+                context.fb_enabled = false;
+                context.fb_width = 960;
+                context.fb_height = 544;
+            } else {
+                const char *end;
+                if (!parse_resolution(argv[i + 1], &end, &context.fb_width, &context.fb_height)
+                        || *end != '\0') {
+                    fprintf(stderr, "Invalid framebuffer resolution: %s\n", argv[i + 1]);
+                    return 2;
+                }
             }
         } else if (!strcmp(argv[i], "--ib")) {
-            if (!parse_ib_list(argv[i + 1], &context)) {
+            if (!strcmp(argv[i + 1], "off")) {
+                context.ib_enabled = false;
+                for (int j = 0; j < INTP_VG_MAX_RES_COUNT; j++) {
+                    context.ib_width[j] = 960;
+                    context.ib_height[j] = 544;
+                }
+            } else if (!parse_ib_list(argv[i + 1], &context)) {
                 fprintf(stderr, "Invalid internal-buffer resolution list: %s\n", argv[i + 1]);
                 return 2;
             }

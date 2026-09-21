@@ -23,6 +23,8 @@ typedef struct {
     uint32_t vblank;
     uint32_t fps_limit;
     uint32_t msaa;
+    bool fb_enabled;
+    bool ib_enabled;
     bool msaa_enabled; // legacy
 } intp_vg_context_t;
 
