@@ -150,8 +150,6 @@ int main(int argc, char *argv[]) {
     context.vblank = 1;
     context.fps_limit = 60;
     context.msaa = 2;
-    context.fb_enabled = true;
-    context.ib_enabled = true;
     context.msaa_enabled = true;
 
     for (int i = 2; i < argc; i += 2) {
@@ -163,7 +161,6 @@ int main(int argc, char *argv[]) {
         if (!strcmp(argv[i], "--fb")) {
             // A disabled option still evaluates to the native size, as the plugin does
             if (!strcmp(argv[i + 1], "off")) {
-                context.fb_enabled = false;
                 context.fb_width = 960;
                 context.fb_height = 544;
             } else {
@@ -176,7 +173,6 @@ int main(int argc, char *argv[]) {
             }
         } else if (!strcmp(argv[i], "--ib")) {
             if (!strcmp(argv[i + 1], "off")) {
-                context.ib_enabled = false;
                 for (int j = 0; j < INTP_VG_MAX_RES_COUNT; j++) {
                     context.ib_width[j] = 960;
                     context.ib_height[j] = 544;

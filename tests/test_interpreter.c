@@ -348,8 +348,6 @@ const intp_testcase_t _TESTS[] = {
     {"vblank",    {0x01},       INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
     {"fps_limit", {0x3C},       INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
     {"msaa",      {0x02},       INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
-    {"fb_enabled", {0x01},      INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
-    {"ib_enabled", {0x01},      INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
 
 #ifdef BUILD_LEGACY_SUPPORT
     // Legacy
@@ -378,11 +376,6 @@ const intp_testcase_t _TESTS_VG_CONTEXT[] = {
     {"vblank",    {0x03},       INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
     {"fps_limit", {0x14},       INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
     {"msaa",      {0x00},       INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
-    {"fb_enabled", {0x00},      INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
-    {"ib_enabled", {0x01},      INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
-    // A patch selects between two values with the enable flags
-    {"960 - (fb_enabled * (960 - fb_w))", {0xC0, 0x03}, INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
-    {"960 - (ib_enabled * (960 - ib_w))", {0x40, 0x01}, INTP_PRIMITIVE_SIZE, DATA_TYPE_UNSIGNED},
 };
 
 const intp_error_testcase_t _TESTS_ERROR[] = {
@@ -737,8 +730,6 @@ int main() {
     context.vblank = 3;
     context.fps_limit = 20;
     context.msaa = 0;
-    context.fb_enabled = false;
-    context.ib_enabled = true;
     intp_set_vg_context(&context);
     context.fb_width = 1;
 

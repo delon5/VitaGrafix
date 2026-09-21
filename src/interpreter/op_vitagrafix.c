@@ -68,22 +68,6 @@ bool op_vg_config_ib_height_i(value_t *out) {
     return true;
 }
 
-bool op_vg_config_fb_enabled(value_t *out) {
-    const intp_vg_context_t *context = intp_get_vg_context();
-    out->type = DATA_TYPE_UNSIGNED;
-    out->size = 4;
-    out->data.uint32 = context->fb_enabled ? 1 : 0;
-    return true;
-}
-
-bool op_vg_config_ib_enabled(value_t *out) {
-    const intp_vg_context_t *context = intp_get_vg_context();
-    out->type = DATA_TYPE_UNSIGNED;
-    out->size = 4;
-    out->data.uint32 = context->ib_enabled ? 1 : 0;
-    return true;
-}
-
 bool op_vg_config_vblank(value_t *out) {
     const intp_vg_context_t *context = intp_get_vg_context();
     out->type = DATA_TYPE_UNSIGNED;
