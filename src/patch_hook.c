@@ -26,30 +26,9 @@
 // stub, so a target needs at least this much of its segment left after it
 #define RATE_TARGET_MIN_BYTES 16
 
-typedef enum {
-    // taiHookFunctionImport() by NID, for the named Sce function directives
-    HOOK_KIND_IMPORT,
-    // taiHookFunctionOffset() into the game, for '>rateDivide()'
-    HOOK_KIND_RATE_DIVIDE
-} vg_hook_kind_t;
-
-typedef struct {
-    vg_hook_kind_t kind;
-
-    // import hooks
-    vg_hook_id_t hook_id;
-    uint32_t import_nid;
-    const void *hook_ptr;
-
-    // rate divided hooks
-    uint8_t segment;
-    uint32_t offset;
-    bool thumb;
-    uint32_t divisor;
-    bool frame_counted;
-    uint32_t ret_value;
-    uint32_t arg_num;
-} vg_hook_request_t;
+// vg_hook_kind_t and vg_hook_request_t live in patch_hook.h: the host side
+// checker in tests/test_patchlist.c reports what a directive resolved to, and
+// it has to read that out of the very request the plugin would act on.
 
 int vg_hook_sceDisplaySetFrameBuf_withWait(const SceDisplayFrameBuf *pParam, int sync) {
     int ret = TAI_CONTINUE(int, g_main.hook_ref[HOOK_DISPLAY_SET_FRAMEBUF_WITH_WAIT], pParam, sync);
@@ -517,7 +496,12 @@ static vg_io_status_t vg_hook_parse_rate_divide(const char line[], int pos, vg_h
     __ret_status(IO_OK, 0, 0);
 }
 
-static vg_io_status_t vg_hook_parse_common(const char line[], vg_feature_t feature,
+/**
+ * Parses one '>' directive into a request, and decides from the configuration
+ * whether it is to be installed. Nothing is hooked here - vg_hook_parse_patch()
+ * applies the result, and the host side patch file checker reports it.
+ */
+vg_io_status_t vg_hook_parse_request(const char line[], vg_feature_t feature,
             vg_hook_request_t *request, uint8_t *shall_hook) {
     vg_io_status_t ret = {IO_OK, 0, 0};
     const vg_config_t *config = vg_config_get();
@@ -535,6 +519,7 @@ static vg_io_status_t vg_hook_parse_common(const char line[], vg_feature_t featu
     if (!strncasecmp(&line[1], "sceDisplaySetFrameBuf_withWait", 30)) {
         request->kind = HOOK_KIND_IMPORT;
         request->hook_id = HOOK_DISPLAY_SET_FRAMEBUF_WITH_WAIT;
+        request->name = "sceDisplaySetFrameBuf_withWait";
         request->import_nid = 0x7A410B64;
         request->hook_ptr = &vg_hook_sceDisplaySetFrameBuf_withWait;
         *shall_hook = config->fps_enabled == FT_ENABLED && config->fps == FPS_30;
@@ -543,6 +528,7 @@ static vg_io_status_t vg_hook_parse_common(const char line[], vg_feature_t featu
     if (!strncasecmp(&line[1], "sceCtrlReadBufferPositive_peekPatched", 37)) {
         request->kind = HOOK_KIND_IMPORT;
         request->hook_id = HOOK_CTRL_READ_BUFFER_POSITIVE;
+        request->name = "sceCtrlReadBufferPositive_peekPatched";
         request->import_nid = 0x67E7AB83;
         request->hook_ptr = &vg_hook_sceCtrlReadBufferPositive_peekPatched;
         *shall_hook = config->fps_enabled == FT_ENABLED && config->fps == FPS_60;
@@ -551,6 +537,7 @@ static vg_io_status_t vg_hook_parse_common(const char line[], vg_feature_t featu
     if (!strncasecmp(&line[1], "sceCtrlReadBufferPositive2_peekPatched", 38)) {
         request->kind = HOOK_KIND_IMPORT;
         request->hook_id = HOOK_CTRL_READ_BUFFER_POSITIVE2;
+        request->name = "sceCtrlReadBufferPositive2_peekPatched";
         request->import_nid = 0xC4226A3E;
         request->hook_ptr = &vg_hook_sceCtrlReadBufferPositive2_peekPatched;
         *shall_hook = config->fps_enabled == FT_ENABLED && config->fps == FPS_60;
@@ -558,6 +545,7 @@ static vg_io_status_t vg_hook_parse_common(const char line[], vg_feature_t featu
     }
     if (!strncasecmp(&line[1], "rateDivide", 10)) {
         // 1 for the leading '>', 10 for the directive name
+        request->name = "rateDivide";
         ret = vg_hook_parse_rate_divide(line, 1 + 10, request);
         if (ret.code != IO_OK)
             return ret;
@@ -578,6 +566,21 @@ static vg_io_status_t vg_hook_parse_common(const char line[], vg_feature_t featu
 }
 
 /**
+ * Installs what a parsed directive asked for, if the configuration asked for it
+ * to be installed at all.
+ */
+vg_io_status_t vg_hook_apply_request(const vg_hook_request_t *request, uint8_t shall_hook) {
+    if (shall_hook) {
+        if (request->kind == HOOK_KIND_RATE_DIVIDE)
+            return vg_hook_function_offset_rate_divide(request);
+
+        return vg_hook_function_import(request->hook_id, request->import_nid, request->hook_ptr);
+    }
+
+    __ret_status(IO_OK, 0, 0);
+}
+
+/**
  * Parses and applies a common hook
  */
 vg_io_status_t vg_hook_parse_patch(const char line[], vg_feature_t feature) {
@@ -586,17 +589,10 @@ vg_io_status_t vg_hook_parse_patch(const char line[], vg_feature_t feature) {
     vg_io_status_t ret = {IO_OK, 0, 0};
 
     // Check for common hook
-    ret = vg_hook_parse_common(line, feature, &request, &shall_hook);
+    ret = vg_hook_parse_request(line, feature, &request, &shall_hook);
     if (ret.code != IO_OK)
         return ret;
 
     // Apply
-    if (shall_hook) {
-        if (request.kind == HOOK_KIND_RATE_DIVIDE)
-            return vg_hook_function_offset_rate_divide(&request);
-
-        return vg_hook_function_import(request.hook_id, request.import_nid, request.hook_ptr);
-    }
-
-    return ret;
+    return vg_hook_apply_request(&request, shall_hook);
 }

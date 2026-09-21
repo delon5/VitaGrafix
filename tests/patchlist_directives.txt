@@ -1,0 +1,52 @@
+# Hook directives, for tests/test_patchlist_directives.sh. Not a real patch
+# file: the addresses are made up, and the segment they are checked against is
+# the one the test passes with '--seg'.
+
+# Outside any section the plugin never reaches this line at all
+>rateDivide(0:0x1000, 2, void)
+
+[PCSA00000, eboot.bin, 0x00000001]
+@FB
+# Every '>' directive belongs under @FPS
+>sceDisplaySetFrameBuf_withWait()
+
+@FPS
+>sceDisplaySetFrameBuf_withWait()
+>sceCtrlReadBufferPositive_peekPatched()
+>sceCtrlReadBufferPositive2_peekPatched()
+# The same import hooked twice is a no-op, not an error
+>sceCtrlReadBufferPositive2_peekPatched()
+
+# The forms of the rate divided hook
+>rateDivide(0:0x1000, 1 + (fps_limit / 60), ret=1)
+>rateDivide(0:0x1010, 2, void, arm, frame)
+>rateDivide(0:0x1020, 2, ret=0x7F, thumb, call, args=2)
+# The same address with the same arguments is a no-op
+>rateDivide(0:0x1000, 1 + (fps_limit / 60), ret=1)
+
+# ... but two lines that disagree about one address are a patch bug
+>rateDivide(0:0x1000, 3, ret=9)
+# A divisor of 0 is not a rate ('fps_limit / 30' is 0 at FPS=20), and 17 is a
+# typo rather than a frame rate ratio
+>rateDivide(0:0x1030, fps_limit / 90, void)
+>rateDivide(0:0x1030, 17, void)
+# A return the wrapper cannot fabricate in r0, and a target taking more
+# arguments than fit in registers
+>rateDivide(0:0x1030, 2, retfloat)
+>rateDivide(0:0x1030, 2, ret=1, args=6)
+# A mid instruction offset, and one past the end of the segment
+>rateDivide(0:0x1031, 2, void)
+>rateDivide(0:0x40000, 2, void)
+# Malformed: no return clause, an unknown trailing token, a repeated one,
+# trailing text, and a directive that does not exist
+>rateDivide(0:0x1030, 2)
+>rateDivide(0:0x1030, 2, void, fast)
+>rateDivide(0:0x1030, 2, void, call, frame)
+>rateDivide(0:0x1030, 2, void) and more
+>noSuchDirective()
+
+# A second section is a different build of the game, and only ever one of them
+# is the one being patched: its addresses are free again
+[PCSA00000, eboot.bin, 0x00000002]
+@FPS
+>rateDivide(0:0x1000, 3, ret=9)
