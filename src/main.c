@@ -217,6 +217,12 @@ int module_start(SceSize argc, const void *args) {
     for (int i = 0; i < MAX_HOOK_NUM; i++) {
         g_main.hook[i] = -1;
     }
+    g_main.rate_hook_num = 0;
+    g_main.frame = 0;
+    for (int i = 0; i < MAX_RATE_HOOK_NUM; i++) {
+        g_main.rate_hook[i].uid = -1;
+        g_main.rate_hook[i].divisor = 0;
+    }
 
     // Get eboot.bin info
     g_main.tai_info.size = sizeof(tai_module_info_t);
@@ -317,6 +323,17 @@ int module_stop(SceSize argc, const void *args) {
             taiInjectRelease(g_main.inject[i - 1]);
     }
     g_main.inject_num = 0;
+
+    // Release rate divided game function hooks before the frame counter they
+    // read from, which lives in the hook[] array below
+    for (uint32_t i = g_main.rate_hook_num; i > 0; i--) {
+        if (g_main.rate_hook[i - 1].uid >= 0) {
+            taiHookRelease(g_main.rate_hook[i - 1].uid, g_main.rate_hook[i - 1].ref);
+            g_main.rate_hook[i - 1].uid = -1;
+            g_main.rate_hook[i - 1].divisor = 0;
+        }
+    }
+    g_main.rate_hook_num = 0;
 
     // Release game hooks, we need to loop the whole array since hooks are indexed by their id
     for (uint8_t i = MAX_HOOK_NUM; i > 0; i--) {

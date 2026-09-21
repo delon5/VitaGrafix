@@ -38,6 +38,39 @@ bool vg_io_is_line_end(const char line[], int pos) {
     return line[pos] == '\0' || line[pos] == '#';
 }
 
+/**
+ * Parses segment & offset (e.g. 0:0x12345) and leaves *pos on the first
+ * character after the offset. The caller decides what may follow (whitespace
+ * for a patch line, ',' or ')' inside a hook directive).
+ */
+vg_io_status_t vg_io_parse_address(const char line[], int *pos, uint8_t *segment, uint32_t *offset) {
+
+    char *next = NULL;
+
+    // Parse segment
+    if (!isdigit(line[*pos]))
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
+    unsigned long segment_value = strtoul(&line[*pos], &next, 10); // always base 10
+    if (next == &line[*pos] || segment_value > UINT8_MAX)
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
+    if (*next != ':') {
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, next - line);
+    }
+    *segment = segment_value;
+    *pos = next - line + 1;
+
+    // Parse offset
+    if (!isdigit(line[*pos]))
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
+    unsigned long long offset_value = strtoull(&line[*pos], &next, 0);
+    if (next == &line[*pos] || offset_value > UINT32_MAX)
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
+    *offset = offset_value;
+    *pos = next - line;
+
+    __ret_status(IO_OK, 0, 0);
+}
+
 vg_io_status_t vg_io_parse_section_header(const char line[], vg_io_section_header_t *header) {
     int pos = 0;
 

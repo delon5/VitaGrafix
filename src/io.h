@@ -49,6 +49,7 @@ typedef struct {
 
 const char *vg_io_status_code_to_string(vg_io_status_code_t code);
 bool vg_io_is_line_end(const char line[], int pos);
+vg_io_status_t vg_io_parse_address(const char line[], int *pos, uint8_t *segment, uint32_t *offset);
 vg_io_status_t vg_io_parse_section_header(const char line[], vg_io_section_header_t *header);
 vg_io_status_t vg_io_parse(const char *path, vg_io_status_t (*parse_line_fn)(const char line[]), bool create);
 

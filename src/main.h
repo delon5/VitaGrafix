@@ -17,7 +17,11 @@
 #define STRING_BUFFER_SIZE 1024
 
 #define MAX_INJECT_NUM 1024
-#define MAX_HOOK_NUM   3
+#define MAX_HOOK_NUM   4
+
+// Function hooks installed by '>rateDivide()' directives. One slot (and one
+// static wrapper, see patch_hook.c) per directive instance.
+#define MAX_RATE_HOOK_NUM 24
 
 #define TITLEID_ANY  "XXXXxxxxx"
 
@@ -35,6 +39,21 @@ typedef enum {
     MODULE_NID_MISMATCH,
     MODULE_MATCH
 } vg_module_match_t;
+
+// A game function that is called only once every 'divisor' displayed frames
+typedef struct {
+    SceUID uid;
+    tai_hook_ref_t ref;
+
+    uint8_t segment;
+    uint32_t offset;
+
+    // 0 = slot unused, 1 = every frame (never installed), n = 1 call in n
+    uint32_t divisor;
+
+    // value handed back to the game for a call that was not made
+    uint32_t ret_value;
+} vg_rate_hook_t;
 
 typedef struct {
     // OSD hook
@@ -57,6 +76,13 @@ typedef struct {
     // eboot hooks
     SceUID hook[MAX_HOOK_NUM];
     tai_hook_ref_t hook_ref[MAX_HOOK_NUM];
+
+    // eboot rate divided function hooks
+    uint32_t rate_hook_num;
+    vg_rate_hook_t rate_hook[MAX_RATE_HOOK_NUM];
+
+    // displayed frame counter, the parity source for the rate divided hooks
+    volatile uint32_t frame;
 
 } vg_main_t;
 

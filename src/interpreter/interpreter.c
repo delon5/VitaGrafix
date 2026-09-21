@@ -19,6 +19,10 @@ intp_status_t intp_evaluate(const char *expression, uint32_t *pos, intp_value_t 
     return parse_expression(expression, pos, value, false, false);
 }
 
+intp_status_t intp_evaluate_arg(const char *expression, uint32_t *pos, intp_value_t *value) {
+    return parse_expression(expression, pos, value, false, true);
+}
+
 /**
  * @brief Copy context into interpreter-global state
  *
