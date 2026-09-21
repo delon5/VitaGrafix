@@ -18,7 +18,7 @@ Redirects the blocking pad read to the non-blocking peek, so a game that reads
 input with the blocking call is not held to 60 reads per second. Installed only
 at `FPS=60`.
 
-## `>rateDivide(<seg>:<offset>, <divisor>, void|ret=<value>[, thumb|arm][, call|frame][, args=<n>])`
+## `>rateDivide(<seg>:<offset>, <divisor>, void|ret=<value>[, thumb|arm][, call|frame][, args=<n>][, union])`
 
 Calls the game function at `<seg>:<offset>` **1 time in `<divisor>`** instead of
 every time. It exists for logic that is written as one step per rendered frame
@@ -113,6 +113,49 @@ that corrupts the call. Treat them as an assertion you make, in the same
 category as `thumb`/`arm`: the plugin holds you to it and cannot check it for
 you. Reading the target's disassembly first is the real guard.
 
+### `union` - let the target see the polls it skipped
+
+A target that reads an input mask the game rebuilds once per **rendered** frame
+cannot simply be rate divided: every bit of that mask is one poll wide, so a
+press that lands on a poll the target skipped is overwritten before it is ever
+read. That is the trap described under [what the hook must not be pointed
+at](#what-the-hook-must-not-be-pointed-at), and `union` is the one way out of
+it.
+
+With `union`, for the duration of each call the slot **makes** - and not one
+instruction longer - the mask is replaced by the OR of its own poll and the
+polls the slot skipped. A press from a skipped poll then arrives one frame
+late, which is what the game does natively at its own rate, instead of being
+lost. Outside that interval the word holds the true value of the poll it
+belongs to, so every full-rate consumer (field, menus, battles, event scripts)
+reads exactly what it would read unpatched.
+
+It needs three things, and refuses the line if it does not get them:
+
+* **an `>inputUnion()` line before it** (`'union' needs an '>inputUnion()' line
+  before it.`), to say where the sampler and the mask are;
+* **`frame` counting** (`'union' needs 'frame' counting.`). Slots that share the
+  accumulator have to agree on which polls are live, or a minigame's two rate
+  divided halves land on opposite parities and only one of them sees the press.
+  Call counting cannot guarantee that; `frame % divisor` does;
+* **a divisor of 2 or 3** (`'union' divisor out of range, allowed: 2..3`). The
+  window a `union` slot ORs together is `<divisor>` polls wide. The shortest gap
+  between two pulses of one button is the sampler's auto-repeat step, three
+  polls; at a divisor of 4 a window holds two repeat ticks of one button, the OR
+  collapses them into one, and held input silently loses steps. Divisors 2 and 3
+  are exactly safe, and are the only ones a 60 Hz unlock produces.
+
+Every `union` slot that installs must also divide the same way (`'union' slots
+do not all divide the same way.`). Slots without `union` are not held to it.
+
+What `union` does **not** fix: auto-repeat itself. The repeat machine lives in
+the sampler, which runs once per rendered frame, so at `FPS=60` a held direction
+repeats twice as fast after half the delay - in the rate divided minigame
+exactly as in every other menu of the game. Dividing the sampler is not an
+option (that is double-registration for every other consumer), so the honest
+claim for a patch built on this is "taps are correct, held input scrolls at
+menu speed", not "restored to native".
+
 ### A target that calls itself
 
 Only the **outermost** call of a nest takes part in the count. A call the hooked
@@ -150,6 +193,14 @@ its own recursion, if any, would be counted.
   the unread mask is overwritten by the next poll. That is lost input, not late
   input, and no divisor fixes it. Check what the target reads, and where it is
   produced, before pointing the hook at it.
+
+  `>inputUnion()` and the `union` token are the answer to exactly this shape,
+  and only to this shape: a mask rebuilt from zero every poll, with one-poll-wide
+  bits, produced by a sampler the hook can reach. If the target's input comes
+  from somewhere else, or the sampler runs inside the target (a modal sub-loop
+  that runs whole frames within one call would advance the accumulator while a
+  substitution is live), `union` does not model it - leave that target alone or
+  study it separately.
 * An offset that is not the entry point of a function. taiHEN checks the
   segment index; the plugin additionally refuses an offset that is not an
   instruction boundary, one outside the module's segments, one in a segment
@@ -158,13 +209,70 @@ its own recursion, if any, would be counted.
   so an unchecked target is refused rather than armed. But a plausible wrong
   address *inside* the text segment is hooked wherever it lands.
 
-### Limits
+## `>inputUnion(<seg>:<sampler_offset>, <mask_offset>[, thumb|arm])`
+
+Names the game's input sampler and says where in the pad structure the
+press/repeat pulse mask sits. It is what a `>rateDivide(..., union)` slot reads
+to find that word.
+
+```
+>inputUnion(0:0xC466C, 0xC0)                                        # input sampler
+>rateDivide(0:0xECC38, 1 + (fps_limit / 60), ret=1, frame, union)   # minigame update
+```
+
+`<sampler_offset>` is the function that rebuilds the mask, and it is hooked **at
+entry**. `<mask_offset>` is a byte offset into the structure that sampler takes
+as its **first argument**, which is how the hook reaches the field without a
+per-title global address - the plugin computes `r0 + <mask_offset>` from the
+call it is in. It has to be word aligned and no more than `0x1000`
+(`Input mask offset is not a word inside the pad`); anything else is a misread
+offset rather than a field, and the hook would dereference it on every poll.
+
+The hook does two things, and **writes nothing the game can see**: it publishes
+the address of the mask, and it reads the word before the sampler rebuilds it -
+the residual of the poll that has just ended.
+
+Reading at *entry* rather than at exit is the part to understand. A full-rate
+consumer that acts on a press zeroes the word so that nobody else sees it; by
+the time the next poll starts, that swallow has happened, so the residual is 0
+and contributes nothing to any later union - exactly as it goes natively, where
+a swallow denies the word to every later consumer including the minigame.
+Accumulating the mask as just *built* would instead hand the minigame a press
+another consumer had already acted on, and it would be acted on twice. Reading
+at entry also makes the design independent of where in the frame loop the
+sampler sits, which differs between titles.
+
+The engine's `-1` ("input disabled") is mapped to 0 on the way into the
+accumulator. That is load-bearing, not defensive: the bit helpers every consumer
+goes through begin `if (mask == -1) return 0`, so a `-1` OR'd into a union would
+read as every bit set and suppress a whole live poll's input.
+
+The line **hooks nothing on its own**. The sampler hook is installed by the
+first `union` slot that needs it, so a patch file that declares the sampler and
+then resolves every `union` slot to divisor 1 - the game running at its own rate
+- hooks nothing at all. One sampler per title: a second line that declares a
+different sampler, mask offset or instruction set is refused as a patch bug, and
+an identical repeat is a no-op.
+
+### The one leak, named
+
+When a `union` slot swallows the word on account of a press it got from the
+accumulator, that swallow stands - the plugin only puts the true poll value back
+if the word is still exactly what it substituted. So a full-rate consumer that
+runs *after* the rate divided target in the same frame (a pause or system menu
+drawn over a minigame) can lose that poll's own bits. It is bounded to one frame
+per press that landed on a skipped poll, and it is never a lost input for the
+rate divided target itself.
+
+## Limits
 
 * 24 rate divided hooks per title (`Too many hooked functions, limit: 24`).
+* One input sampler per title, and it is not hooked until a `union` slot needs
+  it.
 * One hook per address: repeating an identical line is a no-op, but two lines
   about one address that disagree about **any** argument - the divisor, the
-  substitute return, the counting mode, the instruction set or the declared
-  argument count - are refused as a patch bug. Nothing is resolved in favour of
+  substitute return, the counting mode, the instruction set, the declared
+  argument count or `union` - are refused as a patch bug. Nothing is resolved in favour of
   whichever line came first. (Two lines that both resolve to divisor 1 install
   nothing and are not compared.)
 * A skipped call returns without continuing the taiHEN chain - that is the
@@ -182,7 +290,8 @@ being checked:
 
 ```
 $ tests/test_patchlist patch/PCSG/PCSG00490.txt --fps 60 --seg 0:0x21B3F0
-00121 HOOK OK rateDivide 0:000ECC38 divisor=2 ret=0x1 thumb call args=4 install=yes
+00120 HOOK OK inputUnion 0:000C466C mask=pad+0xC0 thumb install=yes
+00121 HOOK OK rateDivide 0:000ECC38 divisor=2 ret=0x1 thumb frame args=4 union=yes install=yes
 ```
 
 `install=no` means the configuration resolves the directive to something the

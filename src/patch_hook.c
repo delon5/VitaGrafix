@@ -22,6 +22,13 @@
 // note on vg_hook_rate_divide_call)
 #define RATE_ARG_MAX 4
 
+// The wrappers over game functions take their arguments as uintptr_t rather
+// than int. On the Vita the two are the same 32 bit register and the ABI is
+// identical; the difference is that a first argument which is a pointer - the
+// pad structure the input sampler is handed - survives on a 64 bit host, so
+// tests/test_hook.c can drive these bodies with a real object.
+typedef uintptr_t vg_hook_arg_t;
+
 // taiHEN relocates the first instructions of a hooked function into its own
 // stub, so a target needs at least this much of its segment left after it
 #define RATE_TARGET_MIN_BYTES 16
@@ -66,6 +73,121 @@ int vg_hook_sceDisplaySetFrameBuf_rateCounter(const SceDisplayFrameBuf *pParam, 
         __atomic_fetch_sub(&g_main.frame, RATE_COUNT_MODULUS, __ATOMIC_ACQ_REL);
 
     return TAI_CONTINUE(int, g_main.hook_ref[HOOK_RATE_FRAME_COUNTER], pParam, sync);
+}
+
+// MAX_INPUT_UNION_RING has to be a power of two, or the write index folding
+// back at 2^32 would land in the wrong slot once
+typedef char vg_hook_input_ring_must_be_pow2[
+        (MAX_INPUT_UNION_RING & (MAX_INPUT_UNION_RING - 1)) == 0 ? 1 : -1];
+
+// ...and it has to hold every poll a 'union' slot skipped
+typedef char vg_hook_input_ring_must_hold_a_window[
+        MAX_INPUT_UNION_RING >= INPUT_UNION_DIVISOR_MAX - 1 ? 1 : -1];
+
+/**
+ * The game's input sampler, hooked at ENTRY by '>inputUnion()'.
+ *
+ * It does two things and writes nothing the game can see:
+ *
+ *  - publishes the address of the pulse mask, computed from the pad structure
+ *    the sampler is handed as its first argument, so that a rate divided
+ *    wrapper can reach the field without a per title global address;
+ *  - reads the mask BEFORE the sampler rebuilds it, which is the residual of
+ *    the poll that has just ended, and pushes it into the ring.
+ *
+ * Reading at entry rather than at exit is what makes a consumer's swallow work.
+ * A consumer that acts on a press zeroes the mask so that nobody else sees it;
+ * at entry that swallow has already happened, so the residual is 0 and
+ * contributes nothing to any later union - exactly as it does natively, where
+ * a swallow denies the word to every later consumer including the rate divided
+ * one. Accumulating the mask as just built would instead hand the minigame a
+ * press another consumer had already acted on, and it would be acted on twice.
+ *
+ * It also makes the design independent of where in the frame loop the sampler
+ * sits: the titles this was written for differ (one updates before it samples,
+ * the others sample first), and with entry reads each poll reaches exactly one
+ * call that a 'union' slot makes.
+ */
+static int vg_hook_input_union_sampler(vg_hook_arg_t a0, vg_hook_arg_t a1,
+            vg_hook_arg_t a2, vg_hook_arg_t a3) {
+    vg_input_hook_t *input = &g_main.input;
+
+    // module_stop clears this before releasing the hook. Unlike a rate divided
+    // target there is nothing useful to substitute for the sampler - it is the
+    // whole game's input - so the cost of the unload window is one unsampled
+    // poll, against following a chain that is being torn down.
+    if (!__atomic_load_n(&input->armed, __ATOMIC_ACQUIRE))
+        return 0;
+
+    // A sampler called with no pad is not something the titles studied do, but
+    // the hook dereferences this argument on every poll, so it is checked
+    if (a0 != 0) {
+        uint32_t *mask = (uint32_t *)(a0 + input->mask_offset);
+        __atomic_store_n(&input->mask_addr, mask, __ATOMIC_RELEASE);
+
+        uint32_t residual = *mask;
+        // -1 is the engine's "input disabled" value, not a set of pulses: the
+        // bit helpers every consumer goes through return 0 for it. OR'd into a
+        // union it would read as every bit set and suppress a whole live poll.
+        if (residual == INPUT_MASK_DISABLED)
+            residual = 0;
+
+        uint32_t head = __atomic_load_n(&input->head, __ATOMIC_ACQUIRE);
+        __atomic_store_n(&input->ring[head % MAX_INPUT_UNION_RING], residual, __ATOMIC_RELEASE);
+        __atomic_store_n(&input->head, head + 1, __ATOMIC_RELEASE);
+    }
+
+    return TAI_CONTINUE(int, input->ref, a0, a1, a2, a3);
+}
+
+/**
+ * Makes one call of a 'union' slot with the skipped polls' pulses folded into
+ * the mask, and takes them out again when the call returns.
+ *
+ * The union exists in the word only for the interval [entry, exit] of this one
+ * call. That is what keeps it invisible: everything the hooked function calls
+ * sees it, which is right because those callees run at the divided rate, and
+ * nothing else in the frame runs during the interval. Writing the union into
+ * the mask from the sampler instead would leave it there for the whole frame,
+ * where every full rate consumer would read it - and a press from a skipped
+ * poll, which those consumers already acted on when it was fresh, would be
+ * acted on a second time.
+ *
+ * The exit test is 'is the word still what we put there'. Untouched means no
+ * consumer inside the call wrote it, so the true one poll value goes back.
+ * Anything else means the game replaced the word - a swallow (a literal 0) or
+ * the -1 disable sentinel - and that write is the game's, so it stays.
+ */
+static int vg_hook_rate_union_call(vg_rate_hook_t *rate_hook, uint32_t divisor,
+            vg_hook_arg_t a0, vg_hook_arg_t a1, vg_hook_arg_t a2, vg_hook_arg_t a3) {
+    vg_input_hook_t *input = &g_main.input;
+    uint32_t *mask = __atomic_load_n(&input->mask_addr, __ATOMIC_ACQUIRE);
+
+    // The sampler has not run yet, so there is no pad address and no poll to
+    // accumulate. Make the call exactly as a slot without 'union' would.
+    if (mask == NULL)
+        return TAI_CONTINUE(int, rate_hook->ref, a0, a1, a2, a3);
+
+    uint32_t saved = *mask;
+
+    // 'saved | ring' rather than the ring alone, for two properties: a saved
+    // value of -1 absorbs the union, so a poll on which the engine has
+    // disabled input stays disabled; and a saved value of 0 - something has
+    // already swallowed this poll - still lets through the stale bits that
+    // nobody has handled.
+    uint32_t combined = saved;
+    uint32_t head = __atomic_load_n(&input->head, __ATOMIC_ACQUIRE);
+    for (uint32_t k = 1; k < divisor; k++) {
+        combined |= __atomic_load_n(&input->ring[(head - k) % MAX_INPUT_UNION_RING],
+                    __ATOMIC_ACQUIRE);
+    }
+
+    *mask = combined;
+    int ret = TAI_CONTINUE(int, rate_hook->ref, a0, a1, a2, a3);
+    if (*mask == combined)
+        *mask = saved;
+
+    return ret;
 }
 
 /**
@@ -195,7 +317,8 @@ static bool vg_hook_rate_shall_run(vg_rate_hook_t *rate_hook, uint32_t divisor) 
  * not happen - and it is only ever pointed at a game internal offset, which no
  * other plugin has reason to hook. Nothing else in VitaGrafix hooks by offset.
  */
-static inline int vg_hook_rate_divide_call(uint32_t slot, int a0, int a1, int a2, int a3) {
+static inline int vg_hook_rate_divide_call(uint32_t slot, vg_hook_arg_t a0, vg_hook_arg_t a1,
+            vg_hook_arg_t a2, vg_hook_arg_t a3) {
     vg_rate_hook_t *rate_hook = &g_main.rate_hook[slot];
 
     // module_stop clears this before releasing the hook: a call that is
@@ -216,17 +339,28 @@ static inline int vg_hook_rate_divide_call(uint32_t slot, int a0, int a1, int a2
     uint32_t depth = vg_hook_rate_enter(rate_hook, thread, &entry);
 
     int ret;
-    if (depth > 1 || vg_hook_rate_shall_run(rate_hook, divisor))
+    if (depth > 1) {
+        // A call the hooked function made into itself is already inside the
+        // outermost call's substitution interval, so the union it should see
+        // is in the word already and there is nothing to do here
         ret = TAI_CONTINUE(int, rate_hook->ref, a0, a1, a2, a3);
-    else
+    } else if (vg_hook_rate_shall_run(rate_hook, divisor)) {
+        ret = rate_hook->union_input
+                    ? vg_hook_rate_union_call(rate_hook, divisor, a0, a1, a2, a3)
+                    : TAI_CONTINUE(int, rate_hook->ref, a0, a1, a2, a3);
+    } else {
+        // A skipped call touches nothing at all: the mask keeps its true one
+        // poll value for whatever else reads it this frame
         ret = (int)rate_hook->ret_value;
+    }
 
     vg_hook_rate_leave(entry);
     return ret;
 }
 
 #define VG_RATE_WRAPPER(n) \
-    static int vg_hook_rate_divide_##n(int a0, int a1, int a2, int a3) { \
+    static int vg_hook_rate_divide_##n(vg_hook_arg_t a0, vg_hook_arg_t a1, \
+                vg_hook_arg_t a2, vg_hook_arg_t a3) { \
         return vg_hook_rate_divide_call(n, a0, a1, a2, a3); \
     }
 #define VG_RATE_WRAPPER_REF(n) (const void *)&vg_hook_rate_divide_##n,
@@ -321,6 +455,89 @@ static vg_io_status_t vg_hook_check_rate_target(const vg_hook_request_t *request
 }
 
 /**
+ * Records what a '>inputUnion()' directive declared about the game's input
+ * sampler. Nothing is hooked here: the sampler hook is installed by the first
+ * 'union' rate divided slot that needs it, so a patch file that declares the
+ * sampler and then resolves every slot to divisor 1 - the game running at its
+ * own rate - hooks nothing at all.
+ */
+static vg_io_status_t vg_hook_record_input_union(const vg_hook_request_t *request) {
+    vg_input_hook_t *input = &g_main.input;
+    vg_io_status_t ret;
+
+    // The line's own validity first, so that a sampler offset which is not an
+    // instruction inside the module says that, rather than being reported as a
+    // disagreement with the line that got there first
+    ret = vg_hook_check_rate_target(request);
+    if (ret.code != IO_OK)
+        return ret;
+
+    if (input->requested) {
+        // Two lines about one sampler that disagree are a patch bug: there is
+        // one pad structure and one mask field per title, so there is no
+        // reading under which both are right
+        if (input->segment != request->segment || input->offset != request->offset
+                || input->thumb != request->thumb || input->mask_offset != request->mask_offset) {
+            vg_log_printf("[HOOK] The input sampler is already declared as seg%03d : %08X"
+                        " (%s) mask pad+0x%X, not seg%03d : %08X (%s) mask pad+0x%X\n",
+                        input->segment, input->offset, input->thumb ? "thumb" : "arm",
+                        input->mask_offset, request->segment, request->offset,
+                        request->thumb ? "thumb" : "arm", request->mask_offset);
+            __ret_status(IO_ERROR_HOOK_CONFLICT, 0, 0);
+        }
+
+        vg_log_printf("[HOOK] The input sampler is already declared, skipping\n");
+        __ret_status(IO_OK, 0, 0);
+    }
+
+    input->segment = request->segment;
+    input->offset = request->offset;
+    input->thumb = request->thumb;
+    input->mask_offset = request->mask_offset;
+    input->requested = true;
+
+    vg_log_printf("[HOOK] Input sampler is seg%03d : %08X (%s), pulse mask at pad+0x%X\n",
+                request->segment, request->offset, request->thumb ? "thumb" : "arm",
+                request->mask_offset);
+    __ret_status(IO_OK, 0, 0);
+}
+
+/**
+ * Installs the sampler hook, for the first 'union' rate divided slot that asks
+ * for it. Repeats are a no-op: one sampler, one accumulator.
+ */
+static vg_io_status_t vg_hook_install_input_union(void) {
+    vg_input_hook_t *input = &g_main.input;
+
+    if (input->uid >= 0)
+        __ret_status(IO_OK, 0, 0);
+
+    // Configure before arming, as the rate divided slots do: the hook body can
+    // be entered as soon as taiHookFunctionOffset() returns, and until 'armed'
+    // is set it reads nothing and publishes nothing.
+    input->mask_addr = NULL;
+    input->head = 0;
+    for (uint32_t i = 0; i < MAX_INPUT_UNION_RING; i++) {
+        input->ring[i] = 0;
+    }
+
+    vg_log_printf("[HOOK] Hooking input sampler seg%03d : %08X (%s) to 0x%X,"
+                " accumulating pad+0x%X\n",
+                input->segment, input->offset, input->thumb ? "thumb" : "arm",
+                &vg_hook_input_union_sampler, input->mask_offset);
+
+    input->uid = taiHookFunctionOffset(&input->ref, g_main.tai_info.modid,
+                input->segment, input->offset, input->thumb ? 1 : 0,
+                &vg_hook_input_union_sampler);
+    if (input->uid < 0) {
+        __ret_status(IO_ERROR_TAI_GENERIC, 0, 0);
+    }
+
+    __atomic_store_n(&input->armed, true, __ATOMIC_RELEASE);
+    __ret_status(IO_OK, 0, 0);
+}
+
+/**
  * Installs the game function hook that a '>rateDivide()' directive asked for.
  */
 static vg_io_status_t vg_hook_function_offset_rate_divide(const vg_hook_request_t *request) {
@@ -343,9 +560,11 @@ static vg_io_status_t vg_hook_function_offset_rate_divide(const vg_hook_request_
                 || g_main.rate_hook[i].ret_value != request->ret_value
                 || g_main.rate_hook[i].frame_counted != request->frame_counted
                 || g_main.rate_hook[i].thumb != request->thumb
+                || g_main.rate_hook[i].union_input != request->union_input
                 || g_main.rate_hook[i].arg_num != request->arg_num) {
             vg_log_printf("[HOOK] seg%03d : %08X is already rate divided with other arguments"
-                        " (divisor %u/%u, return 0x%X/0x%X, %s/%s, %s/%s, args %u/%u)\n",
+                        " (divisor %u/%u, return 0x%X/0x%X, %s/%s, %s/%s, args %u/%u,"
+                        " %s/%s)\n",
                         request->segment, request->offset,
                         g_main.rate_hook[i].divisor, request->divisor,
                         g_main.rate_hook[i].ret_value, request->ret_value,
@@ -353,7 +572,9 @@ static vg_io_status_t vg_hook_function_offset_rate_divide(const vg_hook_request_
                         request->frame_counted ? "frame" : "call",
                         g_main.rate_hook[i].thumb ? "thumb" : "arm",
                         request->thumb ? "thumb" : "arm",
-                        g_main.rate_hook[i].arg_num, request->arg_num);
+                        g_main.rate_hook[i].arg_num, request->arg_num,
+                        g_main.rate_hook[i].union_input ? "union" : "no union",
+                        request->union_input ? "union" : "no union");
             __ret_status(IO_ERROR_HOOK_CONFLICT, 0, 0);
         }
 
@@ -370,6 +591,29 @@ static vg_io_status_t vg_hook_function_offset_rate_divide(const vg_hook_request_
     ret = vg_hook_check_rate_target(request);
     if (ret.code != IO_OK)
         return ret;
+
+    // A 'union' slot needs the sampler named and hooked before it can take a
+    // call, and every 'union' slot has to divide the same way: they decide on
+    // the shared frame counter, so two different divisors mean two different
+    // sets of live polls reading one accumulator, and the minigame halves the
+    // 'frame' token exists to keep in step would not be in step at all.
+    if (request->union_input) {
+        if (!g_main.input.requested) {
+            vg_log_printf("[HOOK] seg%03d : %08X asked for 'union' with no '>inputUnion()'"
+                        " line before it\n", request->segment, request->offset);
+            __ret_status(IO_ERROR_HOOK_UNION_NO_SAMPLER, 0, 0);
+        }
+        if (g_main.input.divisor != 0 && g_main.input.divisor != request->divisor) {
+            vg_log_printf("[HOOK] seg%03d : %08X divides by %u, but the accumulated input is"
+                        " already shared at a divisor of %u\n", request->segment,
+                        request->offset, request->divisor, g_main.input.divisor);
+            __ret_status(IO_ERROR_HOOK_UNION_DIVISOR_CONFLICT, 0, 0);
+        }
+
+        ret = vg_hook_install_input_union();
+        if (ret.code != IO_OK)
+            return ret;
+    }
 
     // A frame counted slot needs the displayed frame counter running before it
     // takes its first decision; a call counted one needs nothing at all
@@ -394,6 +638,7 @@ static vg_io_status_t vg_hook_function_offset_rate_divide(const vg_hook_request_
     rate_hook->divisor = request->divisor;
     rate_hook->frame_counted = request->frame_counted;
     rate_hook->ret_value = request->ret_value;
+    rate_hook->union_input = request->union_input;
     rate_hook->count = 0;
     rate_hook->stall_frame = __atomic_load_n(&g_main.frame, __ATOMIC_ACQUIRE);
     rate_hook->stall_calls = 0;
@@ -402,10 +647,12 @@ static vg_io_status_t vg_hook_function_offset_rate_divide(const vg_hook_request_
         rate_hook->entry[i].depth = 0;
     }
 
-    vg_log_printf("[HOOK] Hooking seg%03d : %08X (%s) to 0x%X, 1 call in %u %s, skipped call returns 0x%X\n",
+    vg_log_printf("[HOOK] Hooking seg%03d : %08X (%s) to 0x%X, 1 call in %u %s,"
+                " skipped call returns 0x%X%s\n",
                 request->segment, request->offset, request->thumb ? "thumb" : "arm",
                 _RATE_WRAPPERS[slot], request->divisor,
-                request->frame_counted ? "displayed frames" : "calls", request->ret_value);
+                request->frame_counted ? "displayed frames" : "calls", request->ret_value,
+                request->union_input ? ", sees the polls it skipped" : "");
 
     rate_hook->uid = taiHookFunctionOffset(&rate_hook->ref, g_main.tai_info.modid,
                 request->segment, request->offset, request->thumb ? 1 : 0, _RATE_WRAPPERS[slot]);
@@ -415,6 +662,10 @@ static vg_io_status_t vg_hook_function_offset_rate_divide(const vg_hook_request_
     }
 
     __atomic_store_n(&rate_hook->armed, true, __ATOMIC_RELEASE);
+    // Only now that a slot really shares the accumulator does its divisor
+    // become the one every other 'union' slot is held to
+    if (request->union_input)
+        g_main.input.divisor = request->divisor;
     g_main.rate_hook_num++;
     __ret_status(IO_OK, 0, 0);
 }
@@ -449,7 +700,7 @@ static vg_io_status_t vg_hook_parse_argument(const char line[], int *pos, uint32
 /**
  * Parses
  *   '>rateDivide(<seg>:<offset>, <divisor>, void|ret=<value>
- *                [, thumb|arm][, call|frame][, args=<n>])'
+ *                [, thumb|arm][, call|frame][, args=<n>][, union])'
  *
  * The game function at <seg>:<offset> is then called 1 time in <divisor>
  * instead of every time, which keeps logic that is written as one step per
@@ -475,6 +726,16 @@ static vg_io_status_t vg_hook_parse_argument(const char line[], int *pos, uint32
  * The skipped call never reaches the game, so its return value is made up:
  * 'void' for a function whose result the game discards (0 is returned), or
  * 'ret=<value>' for one whose result is read.
+ *
+ * 'union' folds the pulses of the polls this slot skipped into the game's
+ * input mask, for the duration of each call the slot makes. Without it a
+ * target that reads a press/repeat mask rebuilt once per rendered frame simply
+ * never sees the presses that landed on a skipped poll. It needs an
+ * '>inputUnion()' line before it to say where the sampler and the mask are,
+ * it needs 'frame' counting so that every slot sharing the accumulator agrees
+ * on which polls are live, and it refuses a divisor above
+ * INPUT_UNION_DIVISOR_MAX - past that a window is wider than the sampler's
+ * auto-repeat step and the OR would swallow repeat ticks.
  *
  * 'args=<n>', 'ret64', 'retfloat' and 'retstruct' are DECLARATIONS BY THE
  * PATCH AUTHOR, not checks on the target. Nothing here reads the target: an
@@ -567,7 +828,9 @@ static vg_io_status_t vg_hook_parse_rate_divide(const char line[], int pos, vg_h
     request->thumb = true;
     request->frame_counted = false;
     request->arg_num = RATE_ARG_MAX;
-    bool isa_given = false, counted_given = false, args_given = false;
+    request->union_input = false;
+    bool isa_given = false, counted_given = false, args_given = false, union_given = false;
+    int pos_union = pos;
 
     while (true) {
         while (isspace(line[pos])) { pos++; }
@@ -601,6 +864,13 @@ static vg_io_status_t vg_hook_parse_rate_divide(const char line[], int pos, vg_h
             if (counted_given)
                 __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos_token);
             counted_given = true;
+        } else if (!strncasecmp(&line[pos], "union", 5)) {
+            request->union_input = true;
+            pos += 5;
+            if (union_given)
+                __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos_token);
+            union_given = true;
+            pos_union = pos_token;
         } else if (!strncasecmp(&line[pos], "args", 4)) {
             pos += 4;
             while (isspace(line[pos])) { pos++; }
@@ -636,7 +906,109 @@ static vg_io_status_t vg_hook_parse_rate_divide(const char line[], int pos, vg_h
     if (!vg_io_is_line_end(line, pos))
         __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos);
 
+    // What 'union' needs that the line itself can answer. A divisor of 1 is a
+    // line that installs nothing at this configuration, so it is not held to
+    // the accumulator's range - it never reaches an accumulator.
+    if (request->union_input) {
+        if (!request->frame_counted) {
+            vg_log_printf("[HOOK] Accumulated input needs 'frame' counting: call counted slots"
+                        " sharing one accumulator do not agree on which polls are live\n");
+            __ret_status(IO_ERROR_HOOK_UNION_NEEDS_FRAME, 0, pos_union);
+        }
+        if (request->divisor > INPUT_UNION_DIVISOR_MAX) {
+            vg_log_printf("[HOOK] A divisor of %u cannot accumulate input: a window of %u polls"
+                        " is wider than the sampler's auto-repeat step, so two repeat ticks of"
+                        " one button fall in it and the union collapses them into one\n",
+                        request->divisor, request->divisor);
+            __ret_status(IO_ERROR_HOOK_UNION_BAD_DIVISOR, 0, pos_union);
+        }
+    }
+
     request->kind = HOOK_KIND_RATE_DIVIDE;
+    __ret_status(IO_OK, 0, 0);
+}
+
+/**
+ * Parses '>inputUnion(<seg>:<sampler_offset>, <mask_offset>[, thumb|arm])'.
+ *
+ * Names the game's input sampler and says where in the pad structure the
+ * press/repeat pulse mask sits. The sampler takes that structure as its first
+ * argument, so the hook reaches the field from its own r0 and no per title
+ * global address is needed - only the offset.
+ *
+ * On its own the line hooks nothing and changes nothing. It is what a
+ * '>rateDivide(..., union)' slot reads to find the mask, and the sampler hook
+ * is installed with the first such slot.
+ */
+static vg_io_status_t vg_hook_parse_input_union(const char line[], int pos,
+            vg_hook_request_t *request) {
+    vg_io_status_t ret;
+
+    while (isspace(line[pos])) { pos++; }
+    if (line[pos] != '(')
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos);
+    pos++;
+
+    // The sampler
+    while (isspace(line[pos])) { pos++; }
+    ret = vg_io_parse_address(line, &pos, &request->segment, &request->offset);
+    if (ret.code != IO_OK)
+        return ret;
+
+    while (isspace(line[pos])) { pos++; }
+    if (line[pos] != ',')
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos);
+    pos++;
+
+    // Where the mask sits inside the pad
+    int pos_mask = pos;
+    while (isspace(line[pos_mask])) { pos_mask++; }
+    ret = vg_hook_parse_argument(line, &pos, &request->mask_offset);
+    if (ret.code != IO_OK)
+        return ret;
+    // The hook dereferences pad + this on every poll. A misread offset is not
+    // something the plugin can recognise, but one that is not a word boundary
+    // or is far past the end of any pad structure is not a field at all.
+    if ((request->mask_offset & 3) != 0 || request->mask_offset > INPUT_MASK_OFFSET_MAX) {
+        vg_log_printf("[HOOK] pad+0x%X is not a word inside the pad structure (0..0x%X,"
+                    " word aligned)\n", request->mask_offset, INPUT_MASK_OFFSET_MAX);
+        __ret_status(IO_ERROR_HOOK_BAD_MASK_OFFSET, 0, pos_mask);
+    }
+
+    // Instruction set of the sampler, Thumb unless the line says otherwise
+    request->thumb = true;
+    bool isa_given = false;
+
+    while (true) {
+        while (isspace(line[pos])) { pos++; }
+        if (line[pos] != ',')
+            break;
+        pos++;
+        while (isspace(line[pos])) { pos++; }
+
+        int pos_token = pos;
+        if (!strncasecmp(&line[pos], "thumb", 5)) {
+            request->thumb = true;
+            pos += 5;
+        } else if (!strncasecmp(&line[pos], "arm", 3)) {
+            request->thumb = false;
+            pos += 3;
+        } else {
+            __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos);
+        }
+
+        if (isa_given)
+            __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos_token);
+        isa_given = true;
+    }
+
+    if (line[pos] != ')')
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos);
+    pos++;
+    if (!vg_io_is_line_end(line, pos))
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos);
+
+    request->kind = HOOK_KIND_INPUT_UNION;
     __ret_status(IO_OK, 0, 0);
 }
 
@@ -687,6 +1059,25 @@ vg_io_status_t vg_hook_parse_request(const char line[], vg_feature_t feature,
         *shall_hook = config->fps_enabled == FT_ENABLED && config->fps == FPS_60;
         return ret;
     }
+    if (!strncasecmp(&line[1], "inputUnion", 10)) {
+        // 1 for the leading '>', 10 for the directive name
+        request->name = "inputUnion";
+        ret = vg_hook_parse_input_union(line, 1 + 10, request);
+        if (ret.code != IO_OK)
+            return ret;
+
+        // Inert unless the frame rate option is on. Whether anything is hooked
+        // at all is decided by the 'union' slots that read this: at the game's
+        // own rate they resolve to divisor 1, install nothing, and never ask
+        // for the sampler hook.
+        *shall_hook = config->fps_enabled == FT_ENABLED;
+        if (!*shall_hook) {
+            vg_log_printf("[HOOK] Not declaring the input sampler seg%03d : %08X"
+                        " (fps_enabled=%d)\n", request->segment, request->offset,
+                        config->fps_enabled);
+        }
+        return ret;
+    }
     if (!strncasecmp(&line[1], "rateDivide", 10)) {
         // 1 for the leading '>', 10 for the directive name
         request->name = "rateDivide";
@@ -717,6 +1108,8 @@ vg_io_status_t vg_hook_apply_request(const vg_hook_request_t *request, uint8_t s
     if (shall_hook) {
         if (request->kind == HOOK_KIND_RATE_DIVIDE)
             return vg_hook_function_offset_rate_divide(request);
+        if (request->kind == HOOK_KIND_INPUT_UNION)
+            return vg_hook_record_input_union(request);
 
         return vg_hook_function_import(request->hook_id, request->import_nid, request->hook_ptr);
     }

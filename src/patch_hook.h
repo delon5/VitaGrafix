@@ -18,7 +18,11 @@ typedef enum {
     // taiHookFunctionImport() by NID, for the named Sce function directives
     HOOK_KIND_IMPORT,
     // taiHookFunctionOffset() into the game, for '>rateDivide()'
-    HOOK_KIND_RATE_DIVIDE
+    HOOK_KIND_RATE_DIVIDE,
+    // taiHookFunctionOffset() onto the game's input sampler, for
+    // '>inputUnion()'. Declares the sampler and the pulse mask field; the hook
+    // itself is installed by the first 'union' rate divided slot that needs it
+    HOOK_KIND_INPUT_UNION
 } vg_hook_kind_t;
 
 /**
@@ -46,6 +50,12 @@ typedef struct {
     bool frame_counted;
     uint32_t ret_value;
     uint32_t arg_num;
+    // '>rateDivide(..., union)': this slot sees the polls it skipped
+    bool union_input;
+
+    // '>inputUnion()': where the pulse mask sits in the pad structure the
+    // sampler takes as its first argument
+    uint32_t mask_offset;
 } vg_hook_request_t;
 
 int sceCtrlPeekBufferPositive2(int port, SceCtrlData *pad_data, int count);

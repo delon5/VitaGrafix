@@ -36,6 +36,11 @@ const char *vg_io_status_code_to_string(vg_io_status_code_t code) {
         case IO_ERROR_HOOK_BAD_TARGET: return "Hook target is not an instruction inside the module.";
         case IO_ERROR_HOOK_UNSUPPORTED_ABI: return "Hook target ABI is not supported.";
         case IO_ERROR_HOOK_NO_MODULE_INFO: return "No module segment info, hook target cannot be checked.";
+        case IO_ERROR_HOOK_BAD_MASK_OFFSET: return "Input mask offset is not a word inside the pad, allowed: 0.." TOSTRING(INPUT_MASK_OFFSET_MAX);
+        case IO_ERROR_HOOK_UNION_NEEDS_FRAME: return "'union' needs 'frame' counting.";
+        case IO_ERROR_HOOK_UNION_BAD_DIVISOR: return "'union' divisor out of range, allowed: 2.." TOSTRING(INPUT_UNION_DIVISOR_MAX);
+        case IO_ERROR_HOOK_UNION_NO_SAMPLER: return "'union' needs an '>inputUnion()' line before it.";
+        case IO_ERROR_HOOK_UNION_DIVISOR_CONFLICT: return "'union' slots do not all divide the same way.";
         default: return "?";
     }
 }

@@ -219,6 +219,11 @@ int module_start(SceSize argc, const void *args) {
     }
     g_main.rate_hook_num = 0;
     g_main.frame = 0;
+    g_main.input.uid = -1;
+    g_main.input.armed = false;
+    g_main.input.requested = false;
+    g_main.input.divisor = 0;
+    g_main.input.mask_addr = NULL;
     for (int i = 0; i < MAX_RATE_HOOK_NUM; i++) {
         g_main.rate_hook[i].uid = -1;
         g_main.rate_hook[i].armed = false;
@@ -357,6 +362,19 @@ int module_stop(SceSize argc, const void *args) {
         }
     }
     g_main.rate_hook_num = 0;
+
+    // ...and the input sampler hook after them, since it is what they read the
+    // accumulated polls from. Disarmed first for the same reason: a call
+    // already on its way in then publishes nothing and accumulates nothing
+    // instead of following a chain that is being released.
+    if (g_main.input.uid >= 0) {
+        __atomic_store_n(&g_main.input.armed, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_main.input.mask_addr, NULL, __ATOMIC_RELEASE);
+        taiHookRelease(g_main.input.uid, g_main.input.ref);
+        g_main.input.uid = -1;
+    }
+    g_main.input.requested = false;
+    g_main.input.divisor = 0;
 
     // Release game hooks, we need to loop the whole array since hooks are indexed by their id
     for (uint8_t i = MAX_HOOK_NUM; i > 0; i--) {

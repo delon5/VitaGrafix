@@ -128,6 +128,8 @@ static void reset_hook_state() {
     g_fake_num = 0;
     g_main.rate_hook_num = 0;
     memset(g_main.rate_hook, 0, sizeof(g_main.rate_hook));
+    memset((void *)&g_main.input, 0, sizeof(g_main.input));
+    g_main.input.uid = -1;
     for (int i = 0; i < MAX_HOOK_NUM; i++) {
         g_main.hook[i] = -1;
         g_main.hook_ref[i] = 0;
@@ -317,10 +319,15 @@ static void write_hook_result(unsigned int line_number, const vg_hook_request_t 
     fprintf(stdout, "%05u HOOK OK %s ", line_number, request->name);
 
     if (request->kind == HOOK_KIND_RATE_DIVIDE) {
-        fprintf(stdout, "%u:%08X divisor=%u ret=0x%X %s %s args=%u ",
+        fprintf(stdout, "%u:%08X divisor=%u ret=0x%X %s %s args=%u union=%s ",
                     request->segment, request->offset, request->divisor, request->ret_value,
                     request->thumb ? "thumb" : "arm",
-                    request->frame_counted ? "frame" : "call", request->arg_num);
+                    request->frame_counted ? "frame" : "call", request->arg_num,
+                    request->union_input ? "yes" : "no");
+    } else if (request->kind == HOOK_KIND_INPUT_UNION) {
+        fprintf(stdout, "%u:%08X mask=pad+0x%X %s ",
+                    request->segment, request->offset, request->mask_offset,
+                    request->thumb ? "thumb" : "arm");
     } else {
         fprintf(stdout, "nid=0x%08X ", request->import_nid);
     }

@@ -77,12 +77,54 @@ static int g_fake_fail_next;       // next taiHook* call fails when set
 static int g_thread_id = 0x4001;
 int sceKernelGetThreadId(void) { return g_thread_id; }
 
-static int call_game_function(int slot_index, int a0);
+static int call_game_function(int slot_index, uintptr_t a0);
 
 // Stands in for the hooked game function
 static int g_original_calls;
-static int g_original_last_args[4];
+static uintptr_t g_original_last_args[4];
 static int g_import_original_calls;
+
+// ------------------------------------------------- the game's input sampler
+
+/*
+ * A stand-in for the pad structure the input sampler is handed, with the
+ * press/repeat pulse mask at a fixed offset in it, and a stand-in for the
+ * sampler itself. Together with the rate divided target below they are enough
+ * to run the whole accumulation: a poll is call_sampler(), a frame is a poll
+ * plus an update plus present_frame().
+ */
+#define TEST_MASK_OFFSET 0x98
+static uint32_t g_pad[64];
+
+static uint32_t *pad_mask() {
+    return (uint32_t *)((uintptr_t)g_pad + TEST_MASK_OFFSET);
+}
+
+// What the sampler builds on the next poll, i.e. the pulses of that poll
+static uint32_t g_poll_mask;
+static int g_sampler_calls;
+
+// What the rate divided target does with the mask it is handed
+static bool g_target_reads_mask;
+typedef enum {
+    TARGET_LEAVES_MASK,     // reads it and writes nothing
+    TARGET_SWALLOWS_MASK,   // "I acted on this, nobody else may": a literal 0
+    TARGET_DISABLES_MASK    // the engine's -1
+} target_mask_write_t;
+static target_mask_write_t g_target_write = TARGET_LEAVES_MASK;
+
+#define TARGET_SAW_MAX 64
+static uint32_t g_target_saw[TARGET_SAW_MAX];
+static int g_target_saw_num;
+
+// The sampler the '>inputUnion()' hook sits on: it rebuilds the mask from
+// scratch on every poll, which is what makes every bit of it one poll wide
+static int fake_sampler_original(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    (void)a1; (void)a2; (void)a3;
+    g_sampler_calls++;
+    *(uint32_t *)(a0 + TEST_MASK_OFFSET) = g_poll_mask;
+    return 0;
+}
 
 // A game function that calls itself, which is what defeated the divisor and
 // truncated the recursion before the wrapper tracked depth. While
@@ -97,13 +139,26 @@ static int g_inner_last_ret;
 static int g_depth;
 static int g_max_depth;
 
-static int fake_import_original(int a0, int a1, int a2, int a3) {
+static int fake_import_original(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
     (void)a0; (void)a1; (void)a2; (void)a3;
     g_import_original_calls++;
     return 0;
 }
-static int fake_original(int a0, int a1, int a2, int a3) {
+static int fake_original(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
     g_original_calls++;
+
+    // The input union tests hand the target the pad, and what it reads out of
+    // the mask while it runs is the whole question
+    if (g_target_reads_mask && a0 != 0) {
+        uint32_t *mask = (uint32_t *)(a0 + TEST_MASK_OFFSET);
+        if (g_target_saw_num < TARGET_SAW_MAX)
+            g_target_saw[g_target_saw_num++] = *mask;
+        if (g_target_write == TARGET_SWALLOWS_MASK)
+            *mask = 0;
+        else if (g_target_write == TARGET_DISABLES_MASK)
+            *mask = 0xFFFFFFFF;
+    }
+
     g_original_last_args[0] = a0;
     g_original_last_args[1] = a1;
     g_original_last_args[2] = a2;
@@ -195,6 +250,17 @@ static void release_all_hooks() {
         }
     }
     g_main.rate_hook_num = 0;
+
+    // ...and the sampler hook after the slots that read what it accumulates
+    if (g_main.input.uid >= 0) {
+        g_main.input.armed = false;
+        g_main.input.mask_addr = NULL;
+        taiHookRelease(g_main.input.uid, g_main.input.ref);
+        g_main.input.uid = -1;
+    }
+    g_main.input.requested = false;
+    g_main.input.divisor = 0;
+
     for (uint8_t i = MAX_HOOK_NUM; i > 0; i--) {
         if (g_main.hook[i - 1] >= 0)
             taiHookRelease(g_main.hook[i - 1], g_main.hook_ref[i - 1]);
@@ -221,10 +287,58 @@ static int g_checks;
     } \
 } while (0)
 
+// The sampler hook is an offset hook like any other, so it has to be kept out
+// of the rate divided hooks' indexing. Remembered by index rather than looked
+// up by uid every time, so that the tests can still reach the hook body after
+// module_stop has released it and cleared the uid.
+static int g_sampler_fake = -1;
+
+static bool fake_is_sampler(int i) {
+    if (g_sampler_fake < 0 && g_main.input.uid >= 0) {
+        for (int j = 0; j < g_fake_num; j++) {
+            if (!g_fake[j].is_import && g_fake[j].uid == g_main.input.uid)
+                g_sampler_fake = j;
+        }
+    }
+    return i == g_sampler_fake;
+}
+
+// The sampler's original is not the rate divided target's: point the installed
+// sampler hook at the stand-in that rebuilds the mask
+static void bind_sampler_original() {
+    for (int i = 0; i < g_fake_num; i++) {
+        if (fake_is_sampler(i))
+            g_fake[i].node.old = (void *)&fake_sampler_original;
+    }
+}
+
+// One poll of the game's input sampler
+static int call_sampler() {
+    for (int i = 0; i < g_fake_num; i++) {
+        if (fake_is_sampler(i)) {
+            return ((int (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t))g_fake[i].func)(
+                        (uintptr_t)g_pad, 0, 0, 0);
+        }
+    }
+    CHECK(false, "no input sampler hook installed");
+    return 0;
+}
+
+// Rate divided hooks only: the sampler hook '>inputUnion()' installs is an
+// offset hook too, and it is counted by fake_sampler_hook_num()
 static int fake_offset_hook_num() {
     int n = 0;
     for (int i = 0; i < g_fake_num; i++) {
-        if (!g_fake[i].is_import)
+        if (!g_fake[i].is_import && !fake_is_sampler(i))
+            n++;
+    }
+    return n;
+}
+
+static int fake_sampler_hook_num() {
+    int n = 0;
+    for (int i = 0; i < g_fake_num; i++) {
+        if (fake_is_sampler(i))
             n++;
     }
     return n;
@@ -289,6 +403,7 @@ static void reset(vg_feature_state_t fps_enabled, vg_fps_t fps) {
     for (int i = 0; i < MAX_HOOK_NUM; i++) {
         g_main.hook[i] = -1;
     }
+    g_main.input.uid = -1;
     for (int i = 0; i < MAX_RATE_HOOK_NUM; i++) {
         g_main.rate_hook[i].uid = -1;
     }
@@ -307,6 +422,13 @@ static void reset(vg_feature_state_t fps_enabled, vg_fps_t fps) {
     g_depth = 0;
     g_max_depth = 0;
     g_thread_id = 0x4001;
+    g_sampler_fake = -1;
+    memset(g_pad, 0, sizeof(g_pad));
+    g_poll_mask = 0;
+    g_sampler_calls = 0;
+    g_target_reads_mask = false;
+    g_target_write = TARGET_LEAVES_MASK;
+    g_target_saw_num = 0;
     set_fps(fps_enabled, fps);
 }
 
@@ -321,13 +443,14 @@ static vg_io_status_code_t parse(const char *line) {
 }
 
 // Calls the body that was hooked over the game function, as the game would
-static int call_game_function(int slot_index, int a0) {
+static int call_game_function(int slot_index, uintptr_t a0) {
     int seen = -1;
     for (int i = 0; i < g_fake_num; i++) {
-        if (g_fake[i].is_import)
+        if (g_fake[i].is_import || fake_is_sampler(i))
             continue;
         if (++seen == slot_index)
-            return ((int (*)(int, int, int, int))g_fake[i].func)(a0, 0, 0, 0);
+            return ((int (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t))g_fake[i].func)(
+                        a0, 0, 0, 0);
     }
     CHECK(false, "no rate divided hook at index %d", slot_index);
     return 0;
@@ -1190,6 +1313,509 @@ static void test_patch_shaped_lines() {
     CHECK(g_fake_num == 0, "a 30 FPS run hooks nothing at all");
 }
 
+
+/*
+ * ------------------------------------------------------------ input union
+ *
+ * The problem: the games these directives were written for rebuild a
+ * press/repeat pulse mask from zero on every poll of their input sampler, and
+ * the sampler runs once per RENDERED frame. Every bit of that word is one poll
+ * wide. A minigame update that is called 1 time in 2 therefore never sees the
+ * presses that landed on a poll it skipped - they are overwritten unread, and
+ * that is lost input rather than late input.
+ *
+ * '>inputUnion()' names the sampler and the mask; 'union' on a rate divided
+ * slot makes that slot see the polls it skipped, for the duration of each call
+ * it makes and not one instruction longer.
+ */
+
+#define TEST_SAMPLER_OFFSET 0x1100
+#define TEST_UNION_TARGET   0x2000
+
+// Sets up the pair the rest of these tests drive: the sampler declared, one
+// accumulating slot over it, and a target that reads the mask it is handed
+static void install_union(const char *rate_line) {
+    reset(FT_ENABLED, FPS_60);
+    char line[128];
+    snprintf(line, sizeof(line), ">inputUnion(0:0x%X, 0x%X)",
+                TEST_SAMPLER_OFFSET, TEST_MASK_OFFSET);
+    CHECK(parse(line) == IO_OK, "the sampler is declared");
+    CHECK(parse(rate_line) == IO_OK, "'%s' installs", rate_line);
+    bind_sampler_original();
+    g_target_reads_mask = true;
+}
+
+// One displayed frame in the order PCSG00246 and PCSG00042 run it: sample,
+// then dispatch the updates, then present
+static void frame_sample_first(int slot, uint32_t poll_mask) {
+    g_poll_mask = poll_mask;
+    call_sampler();
+    call_game_function(slot, (uintptr_t)g_pad);
+    present_frame();
+}
+
+// ...and in the order PCSG00490 runs it: update (on the mask the previous
+// frame's poll built), then sample, then present
+static void frame_update_first(int slot, uint32_t poll_mask) {
+    call_game_function(slot, (uintptr_t)g_pad);
+    g_poll_mask = poll_mask;
+    call_sampler();
+    present_frame();
+}
+
+static void test_input_union_parse_errors() {
+    struct { const char *line; vg_io_status_code_t code; const char *what; } cases[] = {
+        {">inputUnion", IO_ERROR_PARSE_INVALID_TOKEN, "no argument list"},
+        {">inputUnion()", IO_ERROR_PARSE_INVALID_TOKEN, "empty argument list"},
+        {">inputUnion(0:0x1100)", IO_ERROR_PARSE_INVALID_TOKEN, "no mask offset"},
+        {">inputUnion(0:0x1100,)", IO_ERROR_INTERPRETER_ERROR, "empty mask offset"},
+        {">inputUnion(0x1100, 0x98)", IO_ERROR_PARSE_INVALID_TOKEN, "sampler without a segment"},
+        {">inputUnion(0:0x1100, 0x98", IO_ERROR_PARSE_INVALID_TOKEN, "unclosed argument list"},
+        {">inputUnion(0:0x1100, 0x98) x", IO_ERROR_PARSE_INVALID_TOKEN, "junk after the directive"},
+        {">inputUnion(0:0x1100, 0x98, neon)", IO_ERROR_PARSE_INVALID_TOKEN, "unknown instruction set"},
+        {">inputUnion(0:0x1100, 0x98, arm, arm)", IO_ERROR_PARSE_INVALID_TOKEN, "instruction set twice"},
+        {">inputUnion(0:0x1100, 0x98, arm, thumb)", IO_ERROR_PARSE_INVALID_TOKEN, "two instruction sets"},
+        {">inputUnion(0:0x1100, 0x98.0)", IO_ERROR_PARSE_INVALID_TOKEN, "float mask offset"},
+        {">inputUnion(0:0x1100, 0x99)", IO_ERROR_HOOK_BAD_MASK_OFFSET, "mask off a word boundary"},
+        {">inputUnion(0:0x1100, 0x2000)", IO_ERROR_HOOK_BAD_MASK_OFFSET, "mask past any pad"},
+        {">inputUnion(0:0x1100, 0 - 4)", IO_ERROR_HOOK_BAD_MASK_OFFSET, "negative mask offset"},
+        {">inputUnion(0:0x1101, 0x98)", IO_ERROR_HOOK_BAD_TARGET, "sampler off an instruction"},
+        {">inputUnion(0:0x400000, 0x98)", IO_ERROR_HOOK_BAD_TARGET, "sampler past the segment"},
+        {">inputUnion(2:0x1100, 0x98)", IO_ERROR_HOOK_BAD_TARGET, "sampler in a data segment"},
+        {">inputUnion(0:0x1100, 0x98)", IO_OK, "the plain form"},
+        {">inputUnion(0:0x1100, 0x98, arm)", IO_OK, "an arm sampler"},
+        {">inputUnion( 0:0x1100 , 0x40 + 0x58 , thumb )", IO_OK, "whitespace and an expression"},
+        {">inputUnion(0:0x1100, 0)", IO_OK, "the mask at the start of the pad"},
+        {">inputUnion(0:0x1100, 0x1000)", IO_OK, "the last offset a pad may have"},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        reset(FT_ENABLED, FPS_60);
+        vg_io_status_code_t code = parse(cases[i].line);
+        CHECK(code == cases[i].code, "%s: expected %d, got %d (%s)",
+                    cases[i].what, cases[i].code, code, cases[i].line);
+        // Whatever the line says, it never hooks anything on its own
+        CHECK(g_fake_num == 0, "%s: '>inputUnion()' hooks nothing by itself", cases[i].what);
+    }
+
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">inputUnion(0:0x1100, 0x40 + 0x58)") == IO_OK, "expression mask offset");
+    CHECK(g_main.input.mask_offset == 0x98, "...evaluates to 0x98 (got 0x%X)",
+                g_main.input.mask_offset);
+    CHECK(g_main.input.requested, "the sampler is recorded");
+    CHECK(g_main.input.segment == 0 && g_main.input.offset == 0x1100, "...with its address");
+    CHECK(g_main.input.thumb, "...thumb by default");
+    CHECK(g_main.input.uid < 0, "...and is not hooked until a slot needs it");
+
+    // A directive outside @FPS is dead text, like every other one
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse_under(">inputUnion(0:0x1100, 0x98)", FEATURE_FB) == IO_ERROR_HOOK_WRONG_FEATURE,
+                "'>inputUnion()' under @FB is refused");
+
+    // Two lines about the one pad structure that disagree are a patch bug
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">inputUnion(0:0x1100, 0x98)") == IO_OK, "first declaration");
+    CHECK(parse(">inputUnion(0:0x1100, 0x98)") == IO_OK, "an identical repeat is not an error");
+    CHECK(parse(">inputUnion(0:0x1100, 0xC0)") == IO_ERROR_HOOK_CONFLICT, "another mask offset");
+    CHECK(parse(">inputUnion(0:0x1200, 0x98)") == IO_ERROR_HOOK_CONFLICT, "another sampler");
+    CHECK(parse(">inputUnion(0:0x1100, 0x98, arm)") == IO_ERROR_HOOK_CONFLICT, "another instruction set");
+    CHECK(g_main.input.offset == 0x1100 && g_main.input.mask_offset == 0x98 && g_main.input.thumb,
+                "the first declaration is left alone");
+
+    // The whole feature is off when the frame rate option is
+    reset(FT_DISABLED, FPS_60);
+    CHECK(parse(">inputUnion(0:0x1100, 0x98)") == IO_OK, "parses with FPS off");
+    CHECK(!g_main.input.requested, "...and records nothing while the FPS option is off");
+}
+
+// 'union' on a rate divided line: what it needs, and what it refuses
+static void test_input_union_slot_refusals() {
+    // The sampler has to be named first: without it there is nothing to read
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x2000, 2, ret=1, frame, union)") == IO_ERROR_HOOK_UNION_NO_SAMPLER,
+                "'union' with no '>inputUnion()' line is refused");
+    CHECK(g_fake_num == 0, "...and hooks nothing");
+    CHECK(g_main.rate_hook_num == 0, "...and takes no slot");
+
+    // 'frame' counting is mandatory: call counted slots sharing one
+    // accumulator do not agree on which polls are live
+    struct { const char *line; vg_io_status_code_t code; const char *what; } cases[] = {
+        {">rateDivide(0:0x2000, 2, void, union)", IO_ERROR_HOOK_UNION_NEEDS_FRAME, "no counting mode"},
+        {">rateDivide(0:0x2000, 2, void, call, union)", IO_ERROR_HOOK_UNION_NEEDS_FRAME, "call counted"},
+        {">rateDivide(0:0x2000, 4, void, frame, union)", IO_ERROR_HOOK_UNION_BAD_DIVISOR, "divisor 4"},
+        {">rateDivide(0:0x2000, 16, void, frame, union)", IO_ERROR_HOOK_UNION_BAD_DIVISOR, "divisor 16"},
+        {">rateDivide(0:0x2000, 2, void, frame, union, union)", IO_ERROR_PARSE_INVALID_TOKEN, "'union' twice"},
+        {">rateDivide(0:0x2000, 2, void, frame, unions)", IO_ERROR_PARSE_INVALID_TOKEN, "junk after 'union'"},
+        {">rateDivide(0:0x2000, 2, void, frame, union)", IO_OK, "divisor 2"},
+        {">rateDivide(0:0x2000, 3, void, frame, union)", IO_OK, "divisor 3"},
+        {">rateDivide(0:0x2000, 2, ret=1, union, frame, args=2)", IO_OK, "order independent"},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        reset(FT_ENABLED, FPS_60);
+        CHECK(parse(">inputUnion(0:0x1100, 0x98)") == IO_OK, "declare the sampler");
+        vg_io_status_code_t code = parse(cases[i].line);
+        CHECK(code == cases[i].code, "%s: expected %d, got %d (%s)",
+                    cases[i].what, cases[i].code, code, cases[i].line);
+        CHECK(fake_offset_hook_num() == (cases[i].code == IO_OK ? 1 : 0),
+                    "%s: %s hooked", cases[i].what, cases[i].code == IO_OK ? "is" : "is not");
+        // The sampler hook is installed with the first slot that needs it, and
+        // only then - a refused slot leaves it uninstalled
+        CHECK(fake_sampler_hook_num() == (cases[i].code == IO_OK ? 1 : 0),
+                    "%s: the sampler is %s hooked", cases[i].what,
+                    cases[i].code == IO_OK ? "" : "not");
+    }
+
+    // A divisor of 1 is a line that installs nothing here, so the accumulator's
+    // range does not apply to it - it never reaches an accumulator
+    reset(FT_ENABLED, FPS_30);
+    CHECK(parse(">inputUnion(0:0x1100, 0x98)") == IO_OK, "declare the sampler at FPS=30");
+    CHECK(parse(">rateDivide(0:0x2000, 1 + (fps_limit / 60), ret=1, frame, union)") == IO_OK,
+                "an accumulating line is inert at the game's own rate");
+    CHECK(g_fake_num == 0, "...and nothing at all is hooked, sampler included");
+    CHECK(g_main.input.uid < 0, "...the sampler is declared but not hooked");
+
+    // Every accumulating slot has to divide the same way: they decide on the
+    // shared frame counter, so two divisors are two sets of live polls
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">inputUnion(0:0x1100, 0x98)") == IO_OK, "declare the sampler");
+    CHECK(parse(">rateDivide(0:0x2000, 2, void, frame, union)") == IO_OK, "first slot");
+    CHECK(parse(">rateDivide(0:0x2010, 2, void, frame, union)") == IO_OK, "second slot agrees");
+    CHECK(parse(">rateDivide(0:0x2020, 3, void, frame, union)")
+                == IO_ERROR_HOOK_UNION_DIVISOR_CONFLICT, "a third that divides differently");
+    CHECK(g_main.rate_hook_num == 2, "...takes no slot");
+    // A slot that does not accumulate is free to divide however it likes
+    CHECK(parse(">rateDivide(0:0x2030, 3, void, frame)") == IO_OK,
+                "a slot without 'union' is not held to the accumulator's divisor");
+    CHECK(fake_sampler_hook_num() == 1, "one sampler hook for all of them");
+    CHECK(fake_import_hook_num(0x7A410B64) == 1, "one frame counter as well");
+
+    // 'union' is part of a line's identity, like every other argument
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">inputUnion(0:0x1100, 0x98)") == IO_OK, "declare the sampler");
+    CHECK(parse(">rateDivide(0:0x2000, 2, ret=1, frame, union)") == IO_OK, "first line");
+    CHECK(parse(">rateDivide(0:0x2000, 2, ret=1, frame, union)") == IO_OK, "identical repeat");
+    CHECK(parse(">rateDivide(0:0x2000, 2, ret=1, frame)") == IO_ERROR_HOOK_CONFLICT,
+                "no 'union' against 'union' is a disagreement");
+    CHECK(fake_offset_hook_num() == 1, "...and hooks nothing");
+    CHECK(g_main.rate_hook[0].union_input, "the accumulating slot is left alone");
+}
+
+/*
+ * The whole point: a press that lands on a poll the slot skipped still reaches
+ * it, exactly once, one poll late - which is what the game does natively at
+ * its own rate.
+ */
+static void test_input_union_accumulation() {
+    // A press on a live poll, one on a skipped poll, one on the next skipped
+    // poll. Without accumulation the second and third are lost outright.
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    frame_sample_first(0, 0x10);        // frame 0, live
+    frame_sample_first(0, 0x40);        // frame 1, skipped
+    frame_sample_first(0, 0);           // frame 2, live: sees the skipped press
+    frame_sample_first(0, 0x8);         // frame 3, skipped
+    frame_sample_first(0, 0);           // frame 4, live: sees that one too
+    frame_sample_first(0, 0);           // frame 5, skipped
+
+    CHECK(g_sampler_calls == 6, "the sampler still runs every frame (got %d)", g_sampler_calls);
+    CHECK(g_original_calls == 3, "the target still runs 1 frame in 2 (got %d)", g_original_calls);
+    CHECK(g_target_saw_num == 3, "three calls read the mask (got %d)", g_target_saw_num);
+    CHECK(g_target_saw[0] == 0x10, "the live press arrives on its own frame (0x%X)", g_target_saw[0]);
+    CHECK(g_target_saw[1] == 0x40, "the skipped press arrives one frame late (0x%X)", g_target_saw[1]);
+    CHECK(g_target_saw[2] == 0x8, "...and so does the next one (0x%X)", g_target_saw[2]);
+
+    // Nothing is delivered twice: three presses, three bits, and no bit is in
+    // two of the words the target saw
+    CHECK((g_target_saw[0] & g_target_saw[1]) == 0 && (g_target_saw[1] & g_target_saw[2]) == 0
+                && (g_target_saw[0] & g_target_saw[2]) == 0, "no press is presented twice");
+
+    // The same run without 'union' is the bug the directive exists to fix
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x2000, 2, ret=1, frame)") == IO_OK, "install without 'union'");
+    g_target_reads_mask = true;
+    for (int frame = 0; frame < 6; frame++) {
+        static const uint32_t masks[6] = {0x10, 0x40, 0, 0x8, 0, 0};
+        *pad_mask() = masks[frame];
+        call_game_function(0, (uintptr_t)g_pad);
+        present_frame();
+    }
+    CHECK(g_target_saw_num == 3, "the same three calls are made");
+    CHECK(g_target_saw[0] == 0x10 && g_target_saw[1] == 0 && g_target_saw[2] == 0,
+                "without accumulation both skipped presses are lost (0x%X, 0x%X, 0x%X)",
+                g_target_saw[0], g_target_saw[1], g_target_saw[2]);
+
+    // Invisibility: outside the call the word holds the true value of the poll
+    // it belongs to, so every full rate consumer sees what it would natively
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    frame_sample_first(0, 0x10);
+    CHECK(*pad_mask() == 0x10, "after a live call the word is that poll's own value (0x%X)",
+                *pad_mask());
+    frame_sample_first(0, 0x40);
+    CHECK(*pad_mask() == 0x40, "a skipped call touches the word at all (0x%X)", *pad_mask());
+    frame_sample_first(0, 0);
+    CHECK(g_target_saw[1] == 0x40, "the live call saw the union");
+    CHECK(*pad_mask() == 0, "...and left the word at the true value of its own poll (0x%X)",
+                *pad_mask());
+
+    // Divisor 3: two skipped polls, both accumulated, into one call
+    install_union(">rateDivide(0:0x2000, 3, ret=1, frame, union)");
+    frame_sample_first(0, 0x1);         // frame 0, live
+    frame_sample_first(0, 0x2);         // frame 1, skipped
+    frame_sample_first(0, 0x4);         // frame 2, skipped
+    frame_sample_first(0, 0x8);         // frame 3, live
+    CHECK(g_original_calls == 2, "1 frame in 3 (got %d)", g_original_calls);
+    CHECK(g_target_saw[0] == 0x1, "the first live poll (0x%X)", g_target_saw[0]);
+    CHECK(g_target_saw[1] == 0xE, "its own poll and both skipped ones (0x%X)", g_target_saw[1]);
+    CHECK(*pad_mask() == 0x8, "the word is left at the live poll's own value (0x%X)", *pad_mask());
+
+    // The other frame loop ordering - the update runs on the mask the previous
+    // frame's poll built - reaches the same place without being told about it
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    frame_update_first(0, 0x10);        // frame 0, live: the sampler has not run yet
+    frame_update_first(0, 0);           // frame 1, skipped
+    frame_update_first(0, 0x40);        // frame 2, live: sees the frame 0 press
+    frame_update_first(0, 0);           // frame 3, skipped
+    frame_update_first(0, 0);           // frame 4, live: sees the frame 2 press
+    CHECK(g_original_calls == 3, "1 frame in 2 in this ordering too (got %d)", g_original_calls);
+    CHECK(g_target_saw[0] == 0, "nothing had been sampled before the first call (0x%X)",
+                g_target_saw[0]);
+    CHECK(g_target_saw[1] == 0x10, "the press of the poll this call skipped (0x%X)",
+                g_target_saw[1]);
+    CHECK(g_target_saw[2] == 0x40, "...and the next one (0x%X)", g_target_saw[2]);
+}
+
+/*
+ * The residual is read at sampler ENTRY, which is what makes a consumer's
+ * swallow work and what keeps the engine's -1 out of the accumulator.
+ */
+static void test_input_union_residual() {
+    // A full rate consumer that acts on a press zeroes the word so that nobody
+    // else sees it. Read at entry, that swallow has already happened, so the
+    // press contributes nothing to the next union - exactly as natively.
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    frame_sample_first(0, 0);           // frame 0, live
+    g_poll_mask = 0x40;
+    call_sampler();                     // frame 1 poll builds a press...
+    *pad_mask() = 0;                    // ...and a full rate consumer swallows it
+    call_game_function(0, (uintptr_t)g_pad);
+    present_frame();
+    frame_sample_first(0, 0);           // frame 2, live
+    CHECK(g_target_saw_num == 2, "two live calls (got %d)", g_target_saw_num);
+    CHECK(g_target_saw[1] == 0, "a swallowed press is not handed to the minigame (0x%X)",
+                g_target_saw[1]);
+
+    // -1 is the engine's "input disabled" value, not a set of pulses. In the
+    // ring it would read as every bit set and suppress a whole live poll.
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    frame_sample_first(0, 0);
+    g_poll_mask = 0xFFFFFFFF;
+    call_sampler();
+    call_game_function(0, (uintptr_t)g_pad);
+    present_frame();
+    frame_sample_first(0, 0x10);
+    CHECK(g_target_saw[1] == 0x10, "a -1 residual does not reach the union (0x%X)",
+                g_target_saw[1]);
+
+    // ...but a live poll that is itself -1 stays -1: the game has disabled
+    // input for this frame, and accumulating into it must not undo that
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    frame_sample_first(0, 0);
+    frame_sample_first(0, 0x40);        // skipped, a real press
+    frame_sample_first(0, 0xFFFFFFFF);  // live, but input is disabled
+    CHECK(g_target_saw[1] == 0xFFFFFFFF, "a disabled poll absorbs the union (0x%X)",
+                g_target_saw[1]);
+    CHECK(*pad_mask() == 0xFFFFFFFF, "...and the word is left disabled (0x%X)", *pad_mask());
+
+    // A poll something has already swallowed still lets the stale bits nobody
+    // has handled through
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    frame_sample_first(0, 0);
+    frame_sample_first(0, 0x40);        // skipped, a real press
+    g_poll_mask = 0x8;
+    call_sampler();
+    *pad_mask() = 0;                    // a consumer swallows this poll's own press
+    call_game_function(0, (uintptr_t)g_pad);
+    CHECK(g_target_saw[1] == 0x40, "the stale press is still delivered (0x%X)", g_target_saw[1]);
+}
+
+/*
+ * The exit test: the union is taken back out unless the game replaced the word
+ * during the call, in which case that write is the game's and it stays.
+ */
+static void test_input_union_exit() {
+    // Untouched: the true one poll value goes back
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    g_target_write = TARGET_LEAVES_MASK;
+    frame_sample_first(0, 0x10);
+    CHECK(g_target_saw[0] == 0x10, "the call saw its own poll");
+    CHECK(*pad_mask() == 0x10, "an untouched word is restored (0x%X)", *pad_mask());
+
+    // The target swallows: that is the game saying nobody else may act on it,
+    // and it has to survive the wrapper's exit
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    g_target_write = TARGET_SWALLOWS_MASK;
+    frame_sample_first(0, 0x10);
+    CHECK(g_target_saw[0] == 0x10, "the call saw the press");
+    CHECK(*pad_mask() == 0, "a swallow by the target is not undone (0x%X)", *pad_mask());
+
+    // ...including a swallow of a press that came out of the accumulator,
+    // which is the one leak this design has and it is bounded to that frame
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    g_target_write = TARGET_SWALLOWS_MASK;
+    frame_sample_first(0, 0);
+    frame_sample_first(0, 0x40);        // skipped
+    frame_sample_first(0, 0x10);        // live: sees 0x50, swallows the lot
+    CHECK(g_target_saw[1] == 0x50, "the live call saw both polls (0x%X)", g_target_saw[1]);
+    CHECK(*pad_mask() == 0, "the target's swallow stands (0x%X)", *pad_mask());
+
+    // The game writing -1 during the call is a replacement too
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    g_target_write = TARGET_DISABLES_MASK;
+    frame_sample_first(0, 0x10);
+    CHECK(*pad_mask() == 0xFFFFFFFF, "the game disabling input during the call stands (0x%X)",
+                *pad_mask());
+
+    // A call made before the sampler has ever run has no pad address to work
+    // from: it is made exactly as a slot without 'union' would make it
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    *pad_mask() = 0x10;
+    CHECK(g_main.input.mask_addr == NULL, "the sampler has not published a pad yet");
+    CHECK(call_game_function(0, (uintptr_t)g_pad) == FAKE_ORIGINAL_RET, "the call is still made");
+    CHECK(g_target_saw[0] == 0x10, "...and reads the word as it stands (0x%X)", g_target_saw[0]);
+    CHECK(*pad_mask() == 0x10, "...and nothing is substituted into it (0x%X)", *pad_mask());
+    CHECK(g_main.input.head == 0, "...and no poll has been accumulated");
+
+    // A call the hooked function makes into itself is already inside the
+    // outermost call's substitution, so it sees the union and the outermost
+    // call is still the one that puts the word back
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    frame_sample_first(0, 0);
+    g_poll_mask = 0x40;
+    call_sampler();
+    call_game_function(0, (uintptr_t)g_pad);
+    present_frame();
+    g_poll_mask = 0x10;
+    call_sampler();
+    g_recurse_slot = 0;
+    g_recurse_left = 1;
+    call_game_function(0, (uintptr_t)g_pad);
+    CHECK(g_target_saw[1] == 0x50 && g_target_saw[2] == 0x50,
+                "a recursive call sees the same union (0x%X, 0x%X)",
+                g_target_saw[1], g_target_saw[2]);
+    CHECK(*pad_mask() == 0x10, "...and the outermost call still restores the poll (0x%X)",
+                *pad_mask());
+}
+
+/*
+ * Two minigame halves that are rate divided separately have to land on the
+ * same polls, or only one of them sees the press. That is what 'frame' buys,
+ * and it is why 'union' insists on it.
+ */
+static void test_input_union_pairing() {
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">inputUnion(0:0x1100, 0x98)") == IO_OK, "declare the sampler");
+    CHECK(parse(">rateDivide(0:0x2000, 2, ret=1, frame, union)") == IO_OK, "first half");
+    CHECK(parse(">rateDivide(0:0x2010, 2, void, frame, union)") == IO_OK, "second half");
+    bind_sampler_original();
+    g_target_reads_mask = true;
+    CHECK(fake_sampler_hook_num() == 1, "one sampler hook between them");
+    CHECK(fake_offset_hook_num() == 2, "two accumulating slots");
+    CHECK(g_main.input.divisor == 2, "the accumulator is shared at divisor 2");
+
+    for (int frame = 0; frame < 6; frame++) {
+        static const uint32_t masks[6] = {0, 0x40, 0, 0x8, 0, 0};
+        g_poll_mask = masks[frame];
+        call_sampler();
+        call_game_function(0, (uintptr_t)g_pad);
+        call_game_function(1, (uintptr_t)g_pad);
+        present_frame();
+    }
+
+    CHECK(g_original_calls == 6, "both halves run on the same three frames (got %d)",
+                g_original_calls);
+    CHECK(g_target_saw_num == 6, "six calls read the mask (got %d)", g_target_saw_num);
+    // Frames 0, 2 and 4 are live, and the two halves are called back to back
+    CHECK(g_target_saw[0] == 0 && g_target_saw[1] == 0, "frame 0: nothing to see");
+    CHECK(g_target_saw[2] == 0x40 && g_target_saw[3] == 0x40,
+                "frame 2: both halves see the skipped press (0x%X, 0x%X)",
+                g_target_saw[2], g_target_saw[3]);
+    CHECK(g_target_saw[4] == 0x8 && g_target_saw[5] == 0x8,
+                "frame 4: both halves see the next one (0x%X, 0x%X)",
+                g_target_saw[4], g_target_saw[5]);
+    CHECK(*pad_mask() == 0, "the word is the last poll's own value again (0x%X)", *pad_mask());
+}
+
+// Unload: the sampler hook is released with the slots that read it, and a call
+// already on its way in must not follow a chain that is being released
+static void test_input_union_release() {
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    CHECK(g_main.input.armed, "the sampler hook is armed once it is installed");
+    frame_sample_first(0, 0x10);
+    CHECK(g_main.input.mask_addr != NULL, "the sampler published the pad");
+    CHECK(g_sampler_calls == 1, "one poll so far");
+
+    release_all_hooks();
+    for (int i = 0; i < g_fake_num; i++) {
+        CHECK(g_fake[i].released, "hook %d is released", i);
+    }
+    CHECK(!g_main.input.armed, "the sampler hook is disarmed");
+    CHECK(g_main.input.mask_addr == NULL, "...and the published pad is dropped");
+    CHECK(g_main.input.uid < 0, "...and the slot is free again");
+    CHECK(!g_main.input.requested, "...and the declaration is gone with it");
+    CHECK(g_main.input.divisor == 0, "...and so is the divisor it was shared at");
+
+    // The fake hooks are still in place, so a sampler body that ignored 'armed'
+    // would reach its original through a released ref
+    g_poll_mask = 0x40;
+    *pad_mask() = 0x10;
+    CHECK(call_sampler() == 0, "a poll after release returns without continuing");
+    CHECK(g_sampler_calls == 1, "...and follows no released chain");
+    CHECK(*pad_mask() == 0x10, "...and rebuilds nothing");
+
+    // ...and a rate divided slot that was accumulating is disarmed with the
+    // rest, so it substitutes nothing into a word it no longer owns
+    g_original_calls = 0;
+    CHECK(call_game_function(0, (uintptr_t)g_pad) == 1, "a call after release is skipped");
+    CHECK(g_original_calls == 0, "...and makes no call");
+    CHECK(*pad_mask() == 0x10, "...and leaves the word alone (0x%X)", *pad_mask());
+
+    // A second run of the plugin over the same title starts from nothing
+    install_union(">rateDivide(0:0x2000, 2, ret=1, frame, union)");
+    CHECK(g_main.input.head == 0, "the accumulator starts empty");
+    CHECK(g_main.input.mask_addr == NULL, "...with no pad published");
+    frame_sample_first(0, 0x10);
+    CHECK(g_target_saw[0] == 0x10, "...and accumulates from there (0x%X)", g_target_saw[0]);
+}
+
+// The shape the Trails patches use: the sampler declared once, then the
+// minigame updates over it, all dividing the same way and counted in frames
+static void test_input_union_patch_shaped_lines() {
+    static const char *lines[] = {
+        ">inputUnion(0:0xC466C, 0xC0)                                    # input sampler",
+        ">rateDivide(0:0xECC38, 1 + (fps_limit / 60), ret=1, frame, union)   # minigame update",
+        ">rateDivide(0:0xE0E6E, 1 + (fps_limit / 60), void, frame, union)    # its second half"
+    };
+    const int line_num = sizeof(lines) / sizeof(lines[0]);
+
+    reset(FT_ENABLED, FPS_60);
+    for (int i = 0; i < line_num; i++) {
+        CHECK(parse(lines[i]) == IO_OK, "patch line %d installs", i);
+    }
+    CHECK(fake_sampler_hook_num() == 1, "one sampler hook");
+    CHECK(fake_offset_hook_num() == 2, "two accumulating slots");
+    CHECK(fake_import_hook_num(0x7A410B64) == 1, "one frame counter");
+    CHECK(g_main.input.mask_offset == 0xC0, "the mask is at pad+0xC0");
+    CHECK(g_main.rate_hook[0].union_input && g_main.rate_hook[1].union_input,
+                "both slots accumulate");
+
+    // The same file at the game's own rate hooks nothing at all
+    reset(FT_ENABLED, FPS_30);
+    for (int i = 0; i < line_num; i++) {
+        CHECK(parse(lines[i]) == IO_OK, "patch line %d parses at FPS=30", i);
+    }
+    CHECK(g_fake_num == 0, "a 30 FPS run hooks nothing, sampler included");
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-v"))
@@ -1211,6 +1837,14 @@ int main(int argc, char **argv) {
     test_slots();
     test_release();
     test_patch_shaped_lines();
+    test_input_union_parse_errors();
+    test_input_union_slot_refusals();
+    test_input_union_accumulation();
+    test_input_union_residual();
+    test_input_union_exit();
+    test_input_union_pairing();
+    test_input_union_release();
+    test_input_union_patch_shaped_lines();
 
     printf("%s: %d checks, %d failures\n", g_fails ? "FAILED" : "PASSED", g_checks, g_fails);
     return g_fails ? 1 : 0;

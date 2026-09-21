@@ -57,3 +57,44 @@
 [PCSA00000, eboot.bin, 0x00000002]
 @FPS
 >rateDivide(0:0x1000, 3, ret=9)
+
+# Accumulated input: '>inputUnion()' names the sampler and the pulse mask, and
+# a '>rateDivide(..., union)' slot sees the polls it skipped for the duration
+# of each call it makes
+[PCSA00000, eboot.bin, 0x00000003]
+@FPS
+# 'union' before the sampler has been named has nothing to read
+>rateDivide(0:0x2000, 2, ret=1, frame, union)
+>inputUnion(0:0x1100, 0x98)
+# The same declaration again is a no-op; a different one is a patch bug
+>inputUnion(0:0x1100, 0x98)
+>inputUnion(0:0x1100, 0xC0)
+>inputUnion(0:0x1200, 0x98)
+>inputUnion(0:0x1100, 0x98, arm)
+# The forms of an accumulating slot
+>rateDivide(0:0x2000, 1 + (fps_limit / 60), ret=1, frame, union)
+>rateDivide(0:0x2010, 1 + (fps_limit / 60), void, frame, union, args=1)
+# 'union' against no 'union' for one address is a disagreement like any other
+>rateDivide(0:0x2000, 1 + (fps_limit / 60), ret=1, frame)
+# Every accumulating slot has to divide the same way, or they do not agree on
+# which polls are live
+>rateDivide(0:0x2020, 3, void, frame, union)
+# 'union' needs 'frame' counting, and a window wider than the auto-repeat step
+# would collapse two repeat ticks into one
+>rateDivide(0:0x2030, 2, void, union)
+>rateDivide(0:0x2030, 2, void, call, union)
+>rateDivide(0:0x2030, 4, void, frame, union)
+>rateDivide(0:0x2030, 2, void, frame, union, union)
+# A mask offset that is not a word inside the pad structure
+>inputUnion(0:0x1300, 0x99)
+>inputUnion(0:0x1300, 0x2000)
+# ... and the ordinary target checks apply to the sampler too
+>inputUnion(0:0x1301, 0x98)
+>inputUnion(0:0x40000, 0x98)
+>inputUnion(1:0x1100, 0x98)
+# Malformed
+>inputUnion(0:0x1300)
+>inputUnion(0x1300, 0x98)
+>inputUnion(0:0x1300, 0x98, neon)
+>inputUnion(0:0x1300, 0x98, arm, arm)
+>inputUnion(0:0x1300, 0x98) and more
