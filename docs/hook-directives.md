@@ -76,40 +76,97 @@ What is counted, and it is the part to think about:
   that every call made in one frame is made or skipped together. Use it **only**
   for a target that is called several times in one frame on behalf of several
   objects, where those objects have to stay in step with each other. It costs an
-  import hook on `sceDisplaySetFrameBuf`, the counter is advanced on whichever
-  thread presents (which for a GXM display-queue title is not the thread running
-  the game logic, so a call can land either side of a frame boundary), and while
-  nothing is being presented it is not a rate at all - after 256 consecutive
-  skipped calls the plugin makes the next one, so a stall costs speed instead of
-  hanging the game.
+  import hook on `sceDisplaySetFrameBuf`, and the counter is advanced on
+  whichever thread presents - which for a GXM display-queue title is not the
+  thread running the game logic, so a call can land either side of a frame
+  boundary.
 
-### `args=<n>`
+  While nothing is being presented a frame counter is not a clock, and the
+  failure has two halves. Parked on a frame the divisor skips, the hook would
+  skip every call for as long as the stall lasts, and a game waiting on that
+  function would never make progress. Parked on a frame the divisor makes, the
+  hook would make *every* call - no rate division at all, silently, which is the
+  double-speed bug the directive exists to fix. Both are bounded the same way:
+  after 256 consecutive calls with the frame counter unmoved, the slot falls
+  back to counting its own calls until the display moves again, so the game
+  keeps the rate it asked for in either phase. `call` mode has none of this to
+  worry about, which is why it is the default.
 
-Declares how many arguments the target takes. The wrapper carries `r0`-`r3` and
-returns `r0`, so `args=5` or more is refused rather than called in a way that
-would drop the arguments the caller put on the stack. A target that returns a
-float, a struct or a 64-bit value cannot be rate divided either; write
-`retfloat`, `retstruct` or `ret64=...` in place of the return clause to get an
-explicit refusal for such a target instead of a corrupted call.
+### `args=<n>` - a declaration, not a check
+
+The wrapper carries `r0`-`r3` in and `r0` out, and that is all it can carry. A
+target that takes stack arguments, or that returns a float, a struct or a
+64-bit value, **must not be pointed at**: a skipped call hands the game a
+fabricated `r0`, leaves `r1` alone and drops whatever the caller put on the
+stack.
+
+The plugin cannot tell such a target from any other. An ARM prologue does not
+say how many arguments a function takes or what it returns, so there is nothing
+to derive and **nothing is derived** - a line that omits `args=` is not checked
+against anything, and `args=4` is the default because it means "the author did
+not say", not "checked and found to be four".
+
+What `args=<n>`, `ret64`, `retfloat` and `retstruct` buy is a way for an author
+who *has* worked the shape out to write it down and get the line refused at
+parse time (`Hook target ABI is not supported.`) instead of shipping a hook
+that corrupts the call. Treat them as an assertion you make, in the same
+category as `thumb`/`arm`: the plugin holds you to it and cannot check it for
+you. Reading the target's disassembly first is the real guard.
+
+### A target that calls itself
+
+Only the **outermost** call of a nest takes part in the count. A call the hooked
+function makes into itself is always made, because it only exists at all when
+the outermost call was made; counting it would consume a tick that belongs to no
+game step, and skipping it would truncate the recursion and hand every level
+below the top the fabricated return value. The plugin tracks this per slot and
+per thread, so a call arriving on another thread while one is inside is counted
+as the ordinary call it is rather than mistaken for recursion.
+
+The tracking has room for four threads inside one target at once. A fifth
+concurrent call - which a self-calling game function does not produce on its own
+- is treated as an outermost call, which is what it is; the cost is only that
+its own recursion, if any, would be counted.
 
 ### What the hook must not be pointed at
 
 * A function that draws, presents, or enters a nested frame loop: skipping the
   call would then drop a frame rather than a logic step.
+
+  There is one shape that is not this, and it has to be argued rather than
+  assumed: a **modal sub-loop** that the target enters, runs to completion and
+  returns from within the one call, e.g. a menu that blocks until it is
+  dismissed. It presents, but it does not put the target inside the game's own
+  frame loop, so skipping the *outer* call skips a whole modal episode rather
+  than a frame of one. Point the hook at a target that does this only if you
+  have read the sub-loop and can say that is what it does.
 * A function shared with callers that must keep running at full rate - the hook
   is on the function, not on the call site.
+* **A function whose behaviour depends on an input edge that is sampled
+  somewhere else.** This is the trap that killed the directive's first intended
+  use. If the game's input sampler rebuilds a press/repeat mask once per
+  *rendered* frame and the mask's bits are one poll wide, then a target that
+  reads that mask and is called 1 time in 2 simply never sees half the presses -
+  the unread mask is overwritten by the next poll. That is lost input, not late
+  input, and no divisor fixes it. Check what the target reads, and where it is
+  produced, before pointing the hook at it.
 * An offset that is not the entry point of a function. taiHEN checks the
-  segment index; the plugin additionally refuses an offset outside the module's
-  segments and one that is not an instruction boundary, but a plausible wrong
-  address inside the segment is hooked wherever it lands, and a hook writes a
-  branch into code.
+  segment index; the plugin additionally refuses an offset that is not an
+  instruction boundary, one outside the module's segments, one in a segment
+  without the execute bit (that is data, not code), and every target at all when
+  the module's segment table is unavailable - a hook writes a branch into code,
+  so an unchecked target is refused rather than armed. But a plausible wrong
+  address *inside* the text segment is hooked wherever it lands.
 
 ### Limits
 
 * 24 rate divided hooks per title (`Too many hooked functions, limit: 24`).
 * One hook per address: repeating an identical line is a no-op, but two lines
-  about one address that disagree about the divisor, the substitute return or
-  the counting mode are refused as a patch bug.
+  about one address that disagree about **any** argument - the divisor, the
+  substitute return, the counting mode, the instruction set or the declared
+  argument count - are refused as a patch bug. Nothing is resolved in favour of
+  whichever line came first. (Two lines that both resolve to divisor 1 install
+  nothing and are not compared.)
 * A skipped call returns without continuing the taiHEN chain - that is the
   point of the directive, but it means another plugin's hook on the same game
   address would not run for a skipped call.
@@ -137,10 +194,15 @@ as an error with the plugin's own status, and the tool exits non-zero:
 00121 HOOK ERR 12 23 Rate divisor out of range, allowed: 1..16 | >rateDivide(0:0xECC38, fps_limit / 30, ret=1)
 ```
 
-`--seg <index>:<size>` passes the module's segment sizes (VGDump's `info.txt`
-prints them), which is what lets the target check refuse an offset that is past
-the end of its segment or not on an instruction boundary. `VG_LOG=1` in the
-environment prints the plugin's own log alongside the report.
+`--seg <index>:<size>[:<perms>]` passes the module's segments as VGDump's
+`info.txt` prints them; `<perms>` carries the ELF program header flags and
+defaults to `5` (read+execute), so a data segment is written `--seg 1:0x5CBC0:6`.
+Without any `--seg` the checker has no segment table, and then - exactly as the
+plugin does on a console where `sceKernelGetModuleInfo()` failed - every
+`>rateDivide()` target is refused with `No module segment info, hook target
+cannot be checked.` rather than reported as fine. So always pass the segments of
+the build you are checking. `VG_LOG=1` in the environment prints the plugin's
+own log alongside the report.
 
 Run the directives against every frame rate setting, not just the one the patch
 was written for: a divisor that collapses to 0, a conflicting pair of lines and

@@ -71,10 +71,32 @@ static fake_hook_t g_fake[FAKE_HOOK_MAX];
 static int g_fake_num;
 static int g_fake_fail_next;       // next taiHook* call fails when set
 
+// The thread the plugin sees. The wrapper tells a call the game made from a
+// call the hooked function made into itself by thread id, so a test that wants
+// to look like another thread moves this.
+static int g_thread_id = 0x4001;
+int sceKernelGetThreadId(void) { return g_thread_id; }
+
+static int call_game_function(int slot_index, int a0);
+
 // Stands in for the hooked game function
 static int g_original_calls;
 static int g_original_last_args[4];
 static int g_import_original_calls;
+
+// A game function that calls itself, which is what defeated the divisor and
+// truncated the recursion before the wrapper tracked depth. While
+// g_recurse_left is positive the stand-in re-enters the wrapper that hooked
+// it, optionally as a different thread.
+static int g_recurse_slot = -1;
+static int g_recurse_left;
+static int g_recurse_thread;        // 0: the same thread as the outer call
+static int g_inner_calls;
+static int g_inner_made;
+static int g_inner_last_ret;
+static int g_depth;
+static int g_max_depth;
+
 static int fake_import_original(int a0, int a1, int a2, int a3) {
     (void)a0; (void)a1; (void)a2; (void)a3;
     g_import_original_calls++;
@@ -86,6 +108,28 @@ static int fake_original(int a0, int a1, int a2, int a3) {
     g_original_last_args[1] = a1;
     g_original_last_args[2] = a2;
     g_original_last_args[3] = a3;
+
+    if (++g_depth > g_max_depth)
+        g_max_depth = g_depth;
+
+    if (g_recurse_slot >= 0 && g_recurse_left > 0) {
+        g_recurse_left--;
+        g_inner_calls++;
+        if (g_recurse_thread != 0) {
+            // Another thread walks into the same target while this one is
+            // inside it. That is not re-entry and must be counted.
+            int outer_thread = g_thread_id;
+            g_thread_id = g_recurse_thread;
+            g_inner_last_ret = call_game_function(g_recurse_slot, a0);
+            g_thread_id = outer_thread;
+        } else {
+            g_inner_last_ret = call_game_function(g_recurse_slot, a0);
+        }
+        if (g_inner_last_ret == FAKE_ORIGINAL_RET)
+            g_inner_made++;
+    }
+
+    g_depth--;
     return FAKE_ORIGINAL_RET;
 }
 
@@ -224,10 +268,20 @@ static void set_fps(vg_feature_state_t enabled, vg_fps_t fps) {
 // is what bounds a hook target
 #define TEST_SEG0_SIZE 0x200000
 #define TEST_SEG1_SIZE 0x10000
+#define TEST_SEG2_SIZE 0x8000
+
+// SceKernelSegmentInfo::perms carries the ELF program header flags: a text
+// segment reads 0x5 (read+execute), a data segment 0x6 (read+write)
+#define TEST_PERM_TEXT 0x5
+#define TEST_PERM_DATA 0x6
 
 static void set_module_segments() {
     g_main.sce_info.segments[0].memsz = TEST_SEG0_SIZE;
+    g_main.sce_info.segments[0].perms = TEST_PERM_TEXT;
     g_main.sce_info.segments[1].memsz = TEST_SEG1_SIZE;
+    g_main.sce_info.segments[1].perms = TEST_PERM_TEXT;
+    g_main.sce_info.segments[2].memsz = TEST_SEG2_SIZE;
+    g_main.sce_info.segments[2].perms = TEST_PERM_DATA;
 }
 
 static void reset(vg_feature_state_t fps_enabled, vg_fps_t fps) {
@@ -244,6 +298,15 @@ static void reset(vg_feature_state_t fps_enabled, vg_fps_t fps) {
     g_fake_fail_next = 0;
     g_original_calls = 0;
     g_import_original_calls = 0;
+    g_recurse_slot = -1;
+    g_recurse_left = 0;
+    g_recurse_thread = 0;
+    g_inner_calls = 0;
+    g_inner_made = 0;
+    g_inner_last_ret = 0;
+    g_depth = 0;
+    g_max_depth = 0;
+    g_thread_id = 0x4001;
     set_fps(fps_enabled, fps);
 }
 
@@ -517,7 +580,9 @@ static void test_rate_divide_abi() {
 static void test_rate_divide_target_bounds() {
     struct { const char *line; vg_io_status_code_t code; const char *what; } cases[] = {
         {">rateDivide(200:0x1000, 2, void)", IO_ERROR_HOOK_BAD_TARGET, "segment past the module"},
-        {">rateDivide(2:0x1000, 2, void)", IO_ERROR_HOOK_BAD_TARGET, "segment the module does not have"},
+        {">rateDivide(3:0x1000, 2, void)", IO_ERROR_HOOK_BAD_TARGET, "segment the module does not have"},
+        {">rateDivide(2:0x1000, 2, void)", IO_ERROR_HOOK_BAD_TARGET, "offset into a data segment"},
+        {">rateDivide(2:0x1000, 2, void, arm)", IO_ERROR_HOOK_BAD_TARGET, "data segment, arm as well"},
         {">rateDivide(0:0xFFFFFFFF, 2, void)", IO_ERROR_HOOK_BAD_TARGET, "offset past the module"},
         {">rateDivide(0:0x200000, 2, void)", IO_ERROR_HOOK_BAD_TARGET, "offset at the end of the segment"},
         {">rateDivide(0:0x1FFFF8, 2, void)", IO_ERROR_HOOK_BAD_TARGET, "no room for the target's prologue"},
@@ -540,16 +605,38 @@ static void test_rate_divide_target_bounds() {
                     "%s: a refused target takes no slot", cases[i].what);
     }
 
-    // Without module info nothing can be bound checked; say so and carry on
-    // rather than refusing every directive
+    // A segment whose execute bit is clear holds data. An offset into one is a
+    // misread address, not a function entry, and arming a hook over it writes
+    // a branch into the game's data.
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(2:0x0, 2, void)") == IO_ERROR_HOOK_BAD_TARGET,
+                "the start of a data segment is refused too");
+    CHECK(fake_offset_hook_num() == 0, "nothing is hooked over data");
+    reset(FT_ENABLED, FPS_60);
+    g_main.sce_info.segments[2].perms = TEST_PERM_TEXT;
+    CHECK(parse(">rateDivide(2:0x1000, 2, void)") == IO_OK,
+                "the same offset in an executable segment installs");
+
+    // Without module info the target cannot be bound checked at all, and this
+    // check is the only thing between a stale offset and a branch written over
+    // whatever it lands on - so the directive is refused rather than installed
+    // unchecked. sceKernelGetModuleInfo() failing on hardware lands here.
     reset(FT_ENABLED, FPS_60);
     memset(&g_main.sce_info, 0, sizeof(g_main.sce_info));
-    CHECK(parse(">rateDivide(0:0x143CB8, 2, void)") == IO_OK, "no module info: the hook still installs");
-    CHECK(fake_offset_hook_num() == 1, "no module info: hooked anyway");
+    CHECK(parse(">rateDivide(0:0x143CB8, 2, void)") == IO_ERROR_HOOK_NO_MODULE_INFO,
+                "no module info: the directive is refused");
+    CHECK(fake_offset_hook_num() == 0, "no module info: nothing is hooked");
+    CHECK(g_main.rate_hook_num == 0, "no module info: no slot is taken");
     reset(FT_ENABLED, FPS_60);
     memset(&g_main.sce_info, 0, sizeof(g_main.sce_info));
     CHECK(parse(">rateDivide(0:0x143CB9, 2, void)") == IO_ERROR_HOOK_BAD_TARGET,
-                "no module info: alignment is still checked");
+                "no module info: alignment is still checked first");
+    // A directive that installs nothing at this configuration is not parsed
+    // against a segment table it never reaches
+    reset(FT_ENABLED, FPS_30);
+    memset(&g_main.sce_info, 0, sizeof(g_main.sce_info));
+    CHECK(parse(">rateDivide(0:0x143CB8, 1 + (fps_limit / 60), void)") == IO_OK,
+                "no module info: an inert directive is still not an error");
 }
 
 // Two lines about one address that disagree are a patch bug, not something to
@@ -563,9 +650,27 @@ static void test_rate_divide_conflicts() {
     CHECK(parse(">rateDivide(0:0x1000, 2, ret=99)") == IO_ERROR_HOOK_CONFLICT, "a different return is an error");
     CHECK(parse(">rateDivide(0:0x1000, 2, void)") == IO_ERROR_HOOK_CONFLICT, "void against ret=1 is an error");
     CHECK(parse(">rateDivide(0:0x1000, 2, ret=1, frame)") == IO_ERROR_HOOK_CONFLICT, "a different mode is an error");
+    // 'thumb' is the field where being wrong means taiHEN decodes the branch
+    // it writes the wrong way, so it is the one that must not be resolved in
+    // favour of whichever line came first
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=1, arm)") == IO_ERROR_HOOK_CONFLICT,
+                "arm against thumb is an error");
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=1, args=2)") == IO_ERROR_HOOK_CONFLICT,
+                "a different argument count is an error");
     CHECK(g_main.rate_hook[0].divisor == 2 && g_main.rate_hook[0].ret_value == 1,
                 "the installed hook is left alone");
+    CHECK(g_main.rate_hook[0].thumb, "...and keeps the instruction set it was installed with");
     CHECK(fake_offset_hook_num() == 1, "no conflicting line hooked anything");
+
+    // The same the other way round, so that neither order is the lucky one
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=1, arm)") == IO_OK, "arm line installs");
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=1, arm)") == IO_OK, "an identical arm repeat is fine");
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=1)") == IO_ERROR_HOOK_CONFLICT,
+                "thumb against arm is an error");
+    CHECK(!g_main.rate_hook[0].thumb, "the arm hook is left alone");
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=1, arm, args=4)") == IO_OK,
+                "spelling out the default argument count is not a disagreement");
 
     // An identical repeat of a line that is inert is still not an error
     reset(FT_ENABLED, FPS_30);
@@ -676,32 +781,217 @@ static void test_rate_divide_frame_counted() {
     call_game_function(1, 0);
     CHECK(g_original_calls == 2, "both skip frame 1");
 
-    // A game that stops presenting parks the counter. Frame counting has no
-    // answer to that, so the stall guard makes the call rather than let the
-    // game wait for a frame that is not coming.
-    reset(FT_ENABLED, FPS_60);
-    CHECK(parse(">rateDivide(0:0x1000, 2, void, frame)") == IO_OK, "install for the stall test");
-    present_frame();                                  // park on a skipped frame
-    CHECK(g_main.frame % 2 == 1, "parked on a skipped frame");
-    for (uint32_t i = 0; i < RATE_STALL_SKIPS - 1; i++) {
-        CHECK_QUIET(call_game_function(0, 0) == 0, "call %u is skipped", i);
-    }
-    CHECK(g_original_calls == 0, "the first RATE_STALL_SKIPS-1 calls are skipped");
-    CHECK(call_game_function(0, 0) == FAKE_ORIGINAL_RET, "the stalled hook lets a call through");
-    CHECK(g_original_calls == 1, "...exactly one");
-    for (uint32_t i = 0; i < RATE_STALL_SKIPS; i++) {
-        CHECK_QUIET(call_game_function(0, 0) == (i + 1 < RATE_STALL_SKIPS ? 0 : FAKE_ORIGINAL_RET),
-                    "the stall count starts again");
-    }
-    CHECK(g_original_calls == 2, "a stalled frame counted hook runs 1 call in RATE_STALL_SKIPS");
+    // A game that stops presenting parks the frame counter, and a parked
+    // counter is not a clock. Whichever parity it is parked on, the slot falls
+    // back to counting its own calls after RATE_STALL_CALLS of them, so the
+    // game keeps the rate it asked for instead of stalling or running free.
 
-    // ...and it goes back to frame parity as soon as a frame is presented
+    // Parked on a skipped frame: without the fallback the hook would skip
+    // every call for as long as the stall lasts, and a game waiting on that
+    // function would never make progress
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x1000, 3, void, frame)") == IO_OK, "install for the skip stall test");
+    present_frame();                                  // park on a skipped frame
+    CHECK(g_main.frame % 3 != 0, "parked on a skipped frame");
+    for (uint32_t i = 0; i < RATE_STALL_CALLS + 8; i++) {
+        call_game_function(0, 0);
+    }
+    CHECK(g_original_calls > 0, "a stalled frame counted hook does not skip forever");
+    CHECK(g_original_calls < (int)(RATE_STALL_CALLS + 8),
+                "...and does not simply run everything either (%d)", g_original_calls);
+    int before = g_original_calls;
+    int interval = 0, irregular = 0;
+    for (uint32_t i = 0; i < 300; i++) {
+        bool made = call_game_function(0, 0) == FAKE_ORIGINAL_RET;
+        interval++;
+        if (made) {
+            if (i > 0 && interval != 3)
+                irregular++;
+            CHECK_QUIET(interval == 3 || i == 0, "call %u is made after %d, not 3", i, interval);
+            interval = 0;
+        } else {
+            CHECK_QUIET(interval <= 3, "call %u has been skipped for %d in a row", i, interval);
+        }
+    }
+    CHECK(irregular == 0, "the fallback keeps an exact 1 in 3 interval (%d irregular)", irregular);
+    CHECK(g_original_calls - before == 100,
+                "a stalled hook parked on a skipped frame still runs 1 call in 3 (got %d)",
+                g_original_calls - before);
+
+    // Parked on a made frame: the opposite failure, and the one the stall
+    // guard used not to cover at all - every call went through, i.e. no rate
+    // division at all, silently, for as long as the game was not presenting
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x1000, 3, void, frame)") == IO_OK, "install for the run stall test");
+    CHECK(g_main.frame % 3 == 0, "parked on a frame that runs");
+    for (uint32_t i = 0; i < RATE_STALL_CALLS + 8; i++) {
+        call_game_function(0, 0);
+    }
+    CHECK(g_original_calls < (int)(RATE_STALL_CALLS + 8),
+                "a stalled frame counted hook does not run forever (%d)", g_original_calls);
+    before = g_original_calls;
+    interval = 0;
+    irregular = 0;
+    for (uint32_t i = 0; i < 300; i++) {
+        bool made = call_game_function(0, 0) == FAKE_ORIGINAL_RET;
+        interval++;
+        if (made) {
+            if (i > 0 && interval != 3)
+                irregular++;
+            CHECK_QUIET(interval == 3 || i == 0, "call %u is made after %d, not 3", i, interval);
+            interval = 0;
+        } else {
+            CHECK_QUIET(interval <= 3, "call %u has been skipped for %d in a row", i, interval);
+        }
+    }
+    CHECK(irregular == 0, "the fallback keeps an exact 1 in 3 interval here too (%d irregular)",
+                irregular);
+    CHECK(g_original_calls - before == 100,
+                "a stalled hook parked on a made frame runs 1 call in 3 too (got %d)",
+                g_original_calls - before);
+
+    // ...and both go back to frame parity as soon as a frame is presented
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x1000, 2, void, frame)") == IO_OK, "install for the recovery test");
+    for (uint32_t i = 0; i < RATE_STALL_CALLS + 8; i++) {
+        call_game_function(0, 0);
+    }
+    present_frame();
+    before = g_original_calls;
+    CHECK(call_game_function(0, 0) == 0, "an odd frame skips again");
+    CHECK(g_original_calls == before, "...without making the call");
     present_frame();
     CHECK(call_game_function(0, 0) == FAKE_ORIGINAL_RET, "an even frame runs again");
-    CHECK(g_original_calls == 3, "...once");
-    present_frame();
-    CHECK(call_game_function(0, 0) == 0, "and an odd frame skips again");
-    CHECK(g_original_calls == 3, "...without making the call");
+    CHECK(call_game_function(0, 0) == FAKE_ORIGINAL_RET, "...and so does its second call");
+    CHECK(g_original_calls == before + 2, "both calls of that frame were made");
+}
+
+/*
+ * A hooked function that calls itself. Every entry into the wrapper used to
+ * consume a tick of the divisor, so the effective divisor collapsed to d-1
+ * (to 1 at divisor 2, i.e. the directive became a silent no-op), and the inner
+ * call was skipped every single time, truncating the recursion and handing
+ * every level below the top the fabricated return value.
+ *
+ * The rule: only the outermost call of a nest is counted and decided. An inner
+ * call exists only because the outermost call was made, so it is always made.
+ */
+static void test_rate_divide_recursion() {
+    for (uint32_t divisor = 2; divisor <= 4; divisor++) {
+        for (int levels = 1; levels <= 3; levels++) {
+            reset(FT_ENABLED, FPS_60);
+
+            char line[64];
+            snprintf(line, sizeof(line), ">rateDivide(0:0x1000, %u, ret=0x77)", divisor);
+            CHECK(parse(line) == IO_OK, "install a recursive target, divisor %u", divisor);
+
+            const int outer = 60;
+            int outer_made = 0;
+            for (int i = 0; i < outer; i++) {
+                g_recurse_slot = 0;
+                g_recurse_left = levels;
+                if (call_game_function(0, i) == FAKE_ORIGINAL_RET)
+                    outer_made++;
+            }
+
+            CHECK(outer_made == outer / (int)divisor,
+                        "divisor %u with %d levels of recursion makes %d of %d outer calls (got %d)",
+                        divisor, levels, outer / (int)divisor, outer, outer_made);
+            CHECK(g_original_calls == outer_made * (1 + levels),
+                        "divisor %u, %d levels: every made outer call carries its %d inner calls"
+                        " (got %d, want %d)",
+                        divisor, levels, levels, g_original_calls, outer_made * (1 + levels));
+            CHECK(g_inner_calls == outer_made * levels,
+                        "divisor %u, %d levels: inner calls only happen under a made outer call",
+                        divisor, levels);
+            CHECK(g_inner_last_ret == FAKE_ORIGINAL_RET,
+                        "divisor %u, %d levels: an inner call reaches the game, not the substitute",
+                        divisor, levels);
+            CHECK(g_max_depth == levels + 1,
+                        "divisor %u: the recursion is not truncated (depth %d, want %d)",
+                        divisor, g_max_depth, levels + 1);
+        }
+    }
+
+    // The outermost call being skipped means the original never runs, so there
+    // is no inner call to decide: a skipped call's substitute is unchanged
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=0x77)") == IO_OK, "install divisor 2");
+    g_recurse_slot = 0;
+    g_recurse_left = 4;
+    CHECK(call_game_function(0, 0) == FAKE_ORIGINAL_RET, "the first call is made");
+    g_recurse_left = 4;
+    CHECK(call_game_function(0, 0) == 0x77, "the second call is skipped");
+    CHECK(g_inner_calls == 4, "a skipped outer call makes no inner call at all");
+
+    // Frame counted mode takes the same view: the frame decides the outermost
+    // call, and the recursion under a made call is not re-decided
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=0x77, frame)") == IO_OK, "install frame counted");
+    for (int i = 0; i < 8; i++) {
+        g_recurse_slot = 0;
+        g_recurse_left = 2;
+        call_game_function(0, i);
+        present_frame();
+    }
+    CHECK(g_original_calls == 4 * 3, "frame counted: 4 made outer calls, 2 inner each (got %d)",
+                g_original_calls);
+    CHECK(g_max_depth == 3, "frame counted: the recursion is not truncated");
+
+    // Two threads calling the hooked function share the slot's counter: the
+    // divisor is a property of the function, not of a thread
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=0x77)") == IO_OK, "install divisor 2");
+    for (int i = 0; i < 40; i++) {
+        g_thread_id = (i % 2) ? 0x4001 : 0x4002;
+        call_game_function(0, i);
+    }
+    CHECK(g_original_calls == 20, "two threads share one slot's counter (got %d)", g_original_calls);
+    for (uint32_t i = 0; i < RATE_REENTRY_MAX; i++) {
+        CHECK_QUIET(g_main.rate_hook[0].entry[i].thread == 0,
+                    "every re-entry record is released when its call returns");
+    }
+
+    // A second thread walking into the same target while the first is inside
+    // it is NOT re-entry - it is another call from the game, and it takes part
+    // in the count like any other. Here the two streams interleave exactly, so
+    // 40 outer calls and the 40 calls the other thread makes inside them are
+    // 80 counted calls of which 40 are made; what matters is that the inner
+    // call was decided by the divisor rather than waved through.
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=0x77)") == IO_OK, "install divisor 2");
+    for (int i = 0; i < 40; i++) {
+        g_recurse_slot = 0;
+        g_recurse_left = 1;
+        g_recurse_thread = 0x4002;
+        call_game_function(0, i);
+    }
+    CHECK(g_inner_calls == 40, "the other thread called in every time");
+    CHECK(g_original_calls == 40,
+                "80 counted calls across two threads make 40 (got %d)", g_original_calls);
+    CHECK(g_inner_made == 0 && g_inner_last_ret == 0x77,
+                "a call on another thread is counted, not waved through as re-entry");
+
+    // More threads inside one target than there are re-entry records: such a
+    // call is treated as the outermost call it is, never as a free pass
+    reset(FT_ENABLED, FPS_60);
+    CHECK(parse(">rateDivide(0:0x1000, 2, ret=0x77)") == IO_OK, "install divisor 2");
+    g_recurse_slot = 0;
+    for (uint32_t i = 0; i < RATE_REENTRY_MAX; i++) {
+        g_main.rate_hook[0].entry[i].thread = 0x5000 + i;
+        g_main.rate_hook[0].entry[i].depth = 1;
+    }
+    int no_record_made = 0;
+    for (int i = 0; i < 20; i++) {
+        if (call_game_function(0, i) == FAKE_ORIGINAL_RET)
+            no_record_made++;
+    }
+    CHECK(no_record_made == 10, "a call with no free re-entry record is still counted (got %d)",
+                no_record_made);
+    for (uint32_t i = 0; i < RATE_REENTRY_MAX; i++) {
+        CHECK_QUIET(g_main.rate_hook[0].entry[i].thread == (int32_t)(0x5000 + i),
+                    "...and does not release a record it never claimed");
+    }
 }
 
 // Neither counter may produce a short interval where it wraps
@@ -914,6 +1204,7 @@ int main(int argc, char **argv) {
     test_rate_divide_abi();
     test_rate_divide_target_bounds();
     test_rate_divide_conflicts();
+    test_rate_divide_recursion();
     test_rate_divide_calls();
     test_rate_divide_frame_counted();
     test_rate_divide_counter_wrap();

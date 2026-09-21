@@ -24,8 +24,13 @@
 # The same address with the same arguments is a no-op
 >rateDivide(0:0x1000, 1 + (fps_limit / 60), ret=1)
 
-# ... but two lines that disagree about one address are a patch bug
+# ... but two lines that disagree about one address are a patch bug, about any
+# of the arguments: the divisor, the substitute return, what is counted, the
+# instruction set (taiHEN would decode the branch it writes the wrong way) and
+# the argument count the patch declares
 >rateDivide(0:0x1000, 3, ret=9)
+>rateDivide(0:0x1000, 1 + (fps_limit / 60), ret=1, arm)
+>rateDivide(0:0x1000, 1 + (fps_limit / 60), ret=1, args=2)
 # A divisor of 0 is not a rate ('fps_limit / 30' is 0 at FPS=20), and 17 is a
 # typo rather than a frame rate ratio
 >rateDivide(0:0x1030, fps_limit / 90, void)
@@ -37,6 +42,8 @@
 # A mid instruction offset, and one past the end of the segment
 >rateDivide(0:0x1031, 2, void)
 >rateDivide(0:0x40000, 2, void)
+# A segment that holds data, not code: the test declares segment 1 read+write
+>rateDivide(1:0x1000, 2, void)
 # Malformed: no return clause, an unknown trailing token, a repeated one,
 # trailing text, and a directive that does not exist
 >rateDivide(0:0x1030, 2)

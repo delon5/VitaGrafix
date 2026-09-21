@@ -59,6 +59,8 @@ int sceIoMkdir(const char *dir, int mode) { (void)dir; (void)mode; return 0; }
 int sceDisplayWaitVblankStartMulti(unsigned int vcount) { (void)vcount; return 0; }
 int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad_data, int count) { (void)port; (void)pad_data; return count; }
 int sceCtrlPeekBufferPositive2(int port, SceCtrlData *pad_data, int count) { (void)port; (void)pad_data; return count; }
+// Only ever called from inside a wrapper, which this tool never enters
+int sceKernelGetThreadId(void) { return 0x4001; }
 
 // ------------------------------------------------------------- fake taiHEN
 
@@ -243,9 +245,16 @@ static bool parse_msaa(const char *text, intp_vg_context_t *context) {
 }
 
 /**
- * '--seg INDEX:SIZE': the memsz of one segment of the module the patch file is
- * for. src/patch_hook.c refuses a hook target that is not inside its segment,
- * and without this it has no module info to check against.
+ * '--seg INDEX:SIZE[:PERMS]': the memsz and permissions of one segment of the
+ * module the patch file is for, as VGDump's info.txt prints them.
+ * src/patch_hook.c refuses a hook target that is not inside an executable
+ * segment, and without this it has no module info to check against - in which
+ * case it refuses every '>rateDivide()' target rather than arming one
+ * unchecked, here exactly as on hardware.
+ *
+ * PERMS carries the ELF program header flags and defaults to 5 (read+execute),
+ * because a segment a patch names as a hook target is a text segment unless it
+ * says otherwise; a data segment is 6 (read+write).
  */
 static bool parse_segment_size(const char *text) {
     char *next;
@@ -259,11 +268,22 @@ static bool parse_segment_size(const char *text) {
     text = next + 1;
     errno = 0;
     unsigned long long size = strtoull(text, &next, 0);
-    if (errno || next == text || *next != '\0' || size == 0 || size > UINT32_MAX) {
+    if (errno || next == text || (*next != '\0' && *next != ':') || size == 0 || size > UINT32_MAX) {
         return false;
     }
 
+    unsigned long long perms = 5;
+    if (*next == ':') {
+        text = next + 1;
+        errno = 0;
+        perms = strtoull(text, &next, 0);
+        if (errno || next == text || *next != '\0' || perms > UINT32_MAX) {
+            return false;
+        }
+    }
+
     g_main.sce_info.segments[index].memsz = size;
+    g_main.sce_info.segments[index].perms = perms;
     return true;
 }
 
@@ -348,7 +368,7 @@ static bool check_hook_directive(unsigned int line_number, const char *line,
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <patchlist.txt> [--fb WIDTHxHEIGHT|off] [--ib WIDTHxHEIGHT[,WIDTHxHEIGHT...]|off] [--fps 20|30|60] [--msaa 0|1|2] [--seg INDEX:SIZE]\n"
+        fprintf(stderr, "Usage: %s <patchlist.txt> [--fb WIDTHxHEIGHT|off] [--ib WIDTHxHEIGHT[,WIDTHxHEIGHT...]|off] [--fps 20|30|60] [--msaa 0|1|2] [--seg INDEX:SIZE[:PERMS]]\n"
                 "Set VG_LOG in the environment to print the plugin's own log alongside the report.\n", argv[0]);
         return 2;
     }
@@ -415,10 +435,10 @@ int main(int argc, char *argv[]) {
             }
             g_config.fps = context.fps_limit == 60 ? FPS_60 : context.fps_limit == 30 ? FPS_30 : FPS_20;
         } else if (!strcmp(argv[i], "--seg")) {
-            // Segment sizes of the module being patched, so that the plugin's
+            // Segments of the module being patched, so that the plugin's
             // check of a hook target against its segment runs here too
             if (!parse_segment_size(argv[i + 1])) {
-                fprintf(stderr, "Invalid segment size: %s\n", argv[i + 1]);
+                fprintf(stderr, "Invalid segment: %s\n", argv[i + 1]);
                 return 2;
             }
         } else if (!strcmp(argv[i], "--msaa")) {

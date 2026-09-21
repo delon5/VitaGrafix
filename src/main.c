@@ -229,7 +229,16 @@ int module_start(SceSize argc, const void *args) {
     g_main.tai_info.size = sizeof(tai_module_info_t);
     g_main.sce_info.size = sizeof(SceKernelModuleInfo);
     taiGetModuleInfo(TAI_MAIN_MODULE, &g_main.tai_info);
-    sceKernelGetModuleInfo(g_main.tai_info.modid, &g_main.sce_info);
+    // The segment table is what bounds a '>rateDivide()' hook target. A failed
+    // call leaves it zeroed, and a zeroed table now refuses every such target
+    // rather than installing it unchecked (see vg_hook_check_rate_target), so
+    // clear it explicitly and say so in the log instead of carrying on with
+    // whatever is in there.
+    int module_info_ret = sceKernelGetModuleInfo(g_main.tai_info.modid, &g_main.sce_info);
+    if (module_info_ret < 0) {
+        memset(&g_main.sce_info, 0, sizeof(g_main.sce_info));
+        g_main.sce_info.size = sizeof(SceKernelModuleInfo);
+    }
 
     // Create VitaGrafix folder (if doesn't exist)
     sceIoMkdir(VG_DIR, 0777);
@@ -239,6 +248,10 @@ int module_start(SceSize argc, const void *args) {
     vg_log_printf("=======================================\n");
     vg_log_printf("[MAIN] Title ID: %s\n", g_main.titleid);
     vg_log_printf("[MAIN] SELF: %s\n", g_main.sce_info.path);
+    if (module_info_ret < 0) {
+        vg_log_printf("[MAIN] sceKernelGetModuleInfo failed (0x%X): no segment info,"
+                    " hook directives will be refused\n", module_info_ret);
+    }
     vg_log_printf("[MAIN] NID: 0x%X\n", g_main.tai_info.module_nid);
     vg_log_printf("=======================================\n");
 

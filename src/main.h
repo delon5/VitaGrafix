@@ -36,12 +36,22 @@
 
 // Frame counted hooks only. A displayed frame counter stops moving whenever
 // the game stops presenting - a loading screen, a blocking wait, or the step
-// wait loops this feature exists to slow down - and a hook parked on a skipped
-// frame would then skip every call forever, which hangs a game that is waiting
-// for that function to make progress. After this many consecutive skips the
-// next call is made and the count starts again, so a stall costs speed rather
-// than the game. It is far above any plausible number of calls in one frame.
-#define RATE_STALL_SKIPS 256
+// wait loops this feature exists to slow down - and a frozen counter is then
+// not a rate at all: parked on a skipped frame the hook would skip every call
+// forever (hanging a game that is waiting for that function to make progress),
+// and parked on a made frame it would make every call, which is no division at
+// all. After this many consecutive calls with the frame counter unmoved the
+// slot falls back to counting its own calls until the display moves again, so
+// both parities keep the requested rate. It is far above any plausible number
+// of calls a target takes within one displayed frame.
+#define RATE_STALL_CALLS 256
+
+// Threads that can be inside one rate divided hook's target at the same time
+// and still have their nesting tracked separately. A slot needs one record per
+// such thread to tell a call the game made from a call the hooked function
+// made into itself; a call that finds no free record is treated as an
+// outermost call, which is what it almost certainly is.
+#define RATE_REENTRY_MAX 4
 
 #define TITLEID_ANY  "XXXXxxxxx"
 
@@ -60,6 +70,21 @@ typedef enum {
     MODULE_MATCH
 } vg_module_match_t;
 
+// One thread's presence inside a rate divided hook's target. The wrapper needs
+// this to tell a call that came from the game (which the divisor decides) from
+// a call the hooked function made into itself (which must always be made, or
+// the recursion is truncated and every deeper level is handed a fabricated
+// return value).
+typedef struct {
+    // Thread currently inside the target through this record, 0 when free.
+    // Claimed and released with an atomic compare-exchange
+    volatile int32_t thread;
+
+    // How deep that thread is inside the target: 1 for the outermost call.
+    // Written only by the thread that owns the record
+    volatile uint32_t depth;
+} vg_rate_entry_t;
+
 // A game function that is called only 1 time in 'divisor'
 typedef struct {
     SceUID uid;
@@ -72,6 +97,17 @@ typedef struct {
     uint8_t segment;
     uint32_t offset;
 
+    // Instruction set of the target, as the directive declared it: taiHEN
+    // decodes the branch it writes the wrong way if this is wrong, so two
+    // directives about one address that disagree about it are a patch bug
+    bool thumb;
+
+    // Arguments the directive declared the target takes. The wrapper carries
+    // r0-r3 whatever this says - it is the patch author's declaration, checked
+    // against what the wrapper can carry at parse time and kept here only so
+    // that two directives about one address that disagree are refused
+    uint32_t arg_num;
+
     // 0 = slot unused, 1 = every call (never installed), n = 1 call in n
     uint32_t divisor;
 
@@ -80,14 +116,20 @@ typedef struct {
     // frame counter below, so that every call made in one frame agrees.
     bool frame_counted;
 
-    // Calls this slot has taken, the parity source in call counted mode
+    // Outermost calls this slot has taken, the parity source in call counted
+    // mode and the fallback when a frame counted slot's display has stalled
     volatile uint32_t count;
 
-    // Consecutive skipped calls, kept in frame counted mode only: a frame
-    // counter stops moving whenever the game stops presenting, and a hook that
-    // skipped this many calls in a row lets the next one through rather than
-    // waiting for a frame that may never come
-    volatile uint32_t skips;
+    // Frame counted mode only: the displayed frame the last decision was taken
+    // in, and how many consecutive calls have been taken with that frame
+    // unmoved. Past RATE_STALL_CALLS the display counts as stalled and the
+    // slot decides on 'count' instead, so neither parity of a frozen display
+    // costs the game its rate or its progress
+    volatile uint32_t stall_frame;
+    volatile uint32_t stall_calls;
+
+    // Threads currently inside the target, and how deep
+    vg_rate_entry_t entry[RATE_REENTRY_MAX];
 
     // value handed back to the game for a call that was not made
     uint32_t ret_value;

@@ -35,6 +35,7 @@ const char *vg_io_status_code_to_string(vg_io_status_code_t code) {
         case IO_ERROR_HOOK_BAD_DIVISOR: return "Rate divisor out of range, allowed: 1.." TOSTRING(RATE_DIVISOR_MAX);
         case IO_ERROR_HOOK_BAD_TARGET: return "Hook target is not an instruction inside the module.";
         case IO_ERROR_HOOK_UNSUPPORTED_ABI: return "Hook target ABI is not supported.";
+        case IO_ERROR_HOOK_NO_MODULE_INFO: return "No module segment info, hook target cannot be checked.";
         default: return "?";
     }
 }

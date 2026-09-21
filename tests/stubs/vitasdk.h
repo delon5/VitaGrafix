@@ -63,5 +63,6 @@ int sceIoMkdir(const char *dir, int mode);
 
 int sceDisplayWaitVblankStartMulti(unsigned int vcount);
 int sceCtrlPeekBufferPositive(int port, SceCtrlData *pad_data, int count);
+int sceKernelGetThreadId(void);
 
 #endif
