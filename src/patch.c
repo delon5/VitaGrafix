@@ -97,6 +97,41 @@ static vg_io_status_t vg_inject_data(int segidx, uint32_t offset, const void *da
     __ret_status(IO_OK, 0, 0);
 }
 
+/**
+ * Parses segment & offset (e.g. 0:0x12345)
+ */
+static vg_io_status_t vg_patch_parse_address(const char line[], int *pos, uint8_t *segment, uint32_t *offset) {
+
+    char *next = NULL;
+
+    // Parse segment
+    if (!isdigit(line[*pos]))
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
+    unsigned long segment_value = strtoul(&line[*pos], &next, 10); // always base 10
+    if (next == &line[*pos] || segment_value > UINT8_MAX)
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
+    if (*next != ':') {
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, next - line);
+    }
+    *segment = segment_value;
+    *pos = next - line + 1;
+
+    // Parse offset
+    if (!isdigit(line[*pos]))
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
+    unsigned long long offset_value = strtoull(&line[*pos], &next, 0);
+    if (next == &line[*pos] || offset_value > UINT32_MAX)
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
+    if (!isspace(*next))
+        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, next - line);
+    *offset = offset_value;
+    *pos = next - line;
+
+    //vg_log_printf("Address: %d:0x%X\n", *segment, *offset);
+
+    __ret_status(IO_OK, 0, 0);
+}
+
 static vg_io_status_t vg_patch_parse_patch(const char line[]) {
     uint8_t segment = 0;
     uint32_t offset = 0;
@@ -106,13 +141,9 @@ static vg_io_status_t vg_patch_parse_patch(const char line[]) {
     int pos = 0;
 
     // Parse address
-    ret = vg_io_parse_address(line, &pos, &segment, &offset);
+    ret = vg_patch_parse_address(line, &pos, &segment, &offset);
     if (ret.code != IO_OK)
         return ret;
-
-    // A patch line separates the address from the expression with whitespace
-    if (!isspace(line[pos]))
-        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos);
 
     while (isspace(line[pos])) { pos++; }
 
@@ -267,7 +298,7 @@ static vg_io_status_t vg_patch_parse_line(const char line[]) {
 
             // Parse hook
             if (line[0] == '>') {
-                return vg_hook_parse_patch(line, g_patch_feature);
+                return vg_hook_parse_patch(line);
             }
 
 #ifdef BUILD_SIG_SUPPORT

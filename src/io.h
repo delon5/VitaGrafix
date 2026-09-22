@@ -31,20 +31,6 @@ typedef enum {
     IO_ERROR_TAI_PATCH_EXISTS,
     IO_ERROR_TAI_GENERIC,
 
-    // Hook directive error
-    IO_ERROR_TOO_MANY_HOOKS,
-    IO_ERROR_HOOK_WRONG_FEATURE,
-    IO_ERROR_HOOK_CONFLICT,
-    IO_ERROR_HOOK_BAD_DIVISOR,
-    IO_ERROR_HOOK_BAD_TARGET,
-    IO_ERROR_HOOK_UNSUPPORTED_ABI,
-    IO_ERROR_HOOK_NO_MODULE_INFO,
-    IO_ERROR_HOOK_BAD_MASK_OFFSET,
-    IO_ERROR_HOOK_UNION_NEEDS_FRAME,
-    IO_ERROR_HOOK_UNION_BAD_DIVISOR,
-    IO_ERROR_HOOK_UNION_NO_SAMPLER,
-    IO_ERROR_HOOK_UNION_DIVISOR_CONFLICT,
-
     // Patcher directive
     IO_DIRECTIVE_ALTE_FILE
 } vg_io_status_code_t;
@@ -63,7 +49,6 @@ typedef struct {
 
 const char *vg_io_status_code_to_string(vg_io_status_code_t code);
 bool vg_io_is_line_end(const char line[], int pos);
-vg_io_status_t vg_io_parse_address(const char line[], int *pos, uint8_t *segment, uint32_t *offset);
 vg_io_status_t vg_io_parse_section_header(const char line[], vg_io_section_header_t *header);
 vg_io_status_t vg_io_parse(const char *path, vg_io_status_t (*parse_line_fn)(const char line[]), bool create);
 

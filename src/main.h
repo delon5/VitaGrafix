@@ -17,68 +17,7 @@
 #define STRING_BUFFER_SIZE 1024
 
 #define MAX_INJECT_NUM 1024
-#define MAX_HOOK_NUM   4
-
-// Function hooks installed by '>rateDivide()' directives. One slot (and one
-// static wrapper, see patch_hook.c) per directive instance.
-#define MAX_RATE_HOOK_NUM 24
-
-// A rate divided call runs 1 time in N. Anything above this is a patch typo
-// rather than a frame rate ratio, and would stall the game function forever.
-#define RATE_DIVISOR_MAX 16
-
-// Every counter a rate divided hook reads is folded back here instead of
-// wrapping at 2^32: this is lcm(1..RATE_DIVISOR_MAX), so every supported
-// divisor divides it and folding back never changes a remainder. Without it
-// the one interval across the wrap is short for any divisor that is not a
-// power of two.
-#define RATE_COUNT_MODULUS 720720u
-
-// Frame counted hooks only. A displayed frame counter stops moving whenever
-// the game stops presenting - a loading screen, a blocking wait, or the step
-// wait loops this feature exists to slow down - and a frozen counter is then
-// not a rate at all: parked on a skipped frame the hook would skip every call
-// forever (hanging a game that is waiting for that function to make progress),
-// and parked on a made frame it would make every call, which is no division at
-// all. After this many consecutive calls with the frame counter unmoved the
-// slot falls back to counting its own calls until the display moves again, so
-// both parities keep the requested rate. It is far above any plausible number
-// of calls a target takes within one displayed frame.
-#define RATE_STALL_CALLS 256
-
-// A 'union' rate divided slot accumulates the input pulses of the polls it
-// skipped, so that a press landing on a skipped poll arrives one poll late
-// instead of being overwritten unread. The window it ORs together is
-// <divisor> polls wide, and the shortest gap between two pulses of one bit is
-// the sampler's 3 poll auto-repeat step: at a divisor above 3 a window can
-// hold two pulses of one bit, the OR collapses them, and held input silently
-// loses repeat ticks. So 'union' takes a divisor of 2 or 3 and refuses more,
-// rather than relying on the frame rate ratio never reaching 4.
-#define INPUT_UNION_DIVISOR_MAX 3
-
-// Polls a 'union' slot has to remember: everything since the previous call it
-// made, which is <divisor> - 1 of them. A power of two, so that the write
-// index folding at 2^32 keeps its position in the ring.
-#define MAX_INPUT_UNION_RING 2
-
-// The engine's "input is disabled" value in the pad's pulse mask. The bit
-// helpers every consumer goes through begin 'if (mask == -1) return 0', so a
-// -1 residual OR'd into a union would suppress a whole live poll's input: the
-// sampler hook maps it to 0 before it reaches the ring.
-#define INPUT_MASK_DISABLED 0xFFFFFFFFu
-
-// How far into the pad structure the pulse mask may sit. The field is at
-// pad+0x98 or pad+0xC0 in the titles this was written for; anything far past
-// that is a misread offset rather than a field, and the hook would dereference
-// it on every poll.
-#define INPUT_MASK_OFFSET_MAX 0x1000
-
-// Threads that can be inside one rate divided hook's target at the same time
-// and still have their nesting tracked separately. A slot needs one record per
-// such thread to tell a call the game made from a call the hooked function
-// made into itself; a call that finds no free record is treated as an
-// outermost call, which is what it almost certainly is.
-#define RATE_REENTRY_MAX 4
+#define MAX_HOOK_NUM   3
 
 #define TITLEID_ANY  "XXXXxxxxx"
 
@@ -96,121 +35,6 @@ typedef enum {
     MODULE_NID_MISMATCH,
     MODULE_MATCH
 } vg_module_match_t;
-
-// One thread's presence inside a rate divided hook's target. The wrapper needs
-// this to tell a call that came from the game (which the divisor decides) from
-// a call the hooked function made into itself (which must always be made, or
-// the recursion is truncated and every deeper level is handed a fabricated
-// return value).
-typedef struct {
-    // Thread currently inside the target through this record, 0 when free.
-    // Claimed and released with an atomic compare-exchange
-    volatile int32_t thread;
-
-    // How deep that thread is inside the target: 1 for the outermost call.
-    // Written only by the thread that owns the record
-    volatile uint32_t depth;
-} vg_rate_entry_t;
-
-// A game function that is called only 1 time in 'divisor'
-typedef struct {
-    SceUID uid;
-    tai_hook_ref_t ref;
-
-    // Cleared before the hook is released, so a call that is still on its way
-    // in takes the skipped path instead of following a released chain
-    volatile bool armed;
-
-    uint8_t segment;
-    uint32_t offset;
-
-    // Instruction set of the target, as the directive declared it: taiHEN
-    // decodes the branch it writes the wrong way if this is wrong, so two
-    // directives about one address that disagree about it are a patch bug
-    bool thumb;
-
-    // Arguments the directive declared the target takes. The wrapper carries
-    // r0-r3 whatever this says - it is the patch author's declaration, checked
-    // against what the wrapper can carry at parse time and kept here only so
-    // that two directives about one address that disagree are refused
-    uint32_t arg_num;
-
-    // 0 = slot unused, 1 = every call (never installed), n = 1 call in n
-    uint32_t divisor;
-
-    // false: the slot counts its own calls (the default, and what the per
-    // title studies ask for). true: the decision is taken from the displayed
-    // frame counter below, so that every call made in one frame agrees.
-    bool frame_counted;
-
-    // Outermost calls this slot has taken, the parity source in call counted
-    // mode and the fallback when a frame counted slot's display has stalled
-    volatile uint32_t count;
-
-    // Frame counted mode only: the displayed frame the last decision was taken
-    // in, and how many consecutive calls have been taken with that frame
-    // unmoved. Past RATE_STALL_CALLS the display counts as stalled and the
-    // slot decides on 'count' instead, so neither parity of a frozen display
-    // costs the game its rate or its progress
-    volatile uint32_t stall_frame;
-    volatile uint32_t stall_calls;
-
-    // Threads currently inside the target, and how deep
-    vg_rate_entry_t entry[RATE_REENTRY_MAX];
-
-    // value handed back to the game for a call that was not made
-    uint32_t ret_value;
-
-    // true: for the duration of a call this slot makes, the game's input pulse
-    // mask is replaced by the union of that poll's mask and the masks of the
-    // polls this slot skipped, and put back when the call returns. Needs
-    // '>inputUnion()' to have named the sampler, and 'frame' counting so that
-    // every slot sharing the accumulator agrees on which polls are live
-    bool union_input;
-} vg_rate_hook_t;
-
-// What '>inputUnion()' declared about the game's input sampler, and the poll
-// residuals it has accumulated. One per title: the pad structure is a single
-// object that every sampler call site passes, so there is one mask field and
-// one accumulator.
-typedef struct {
-    // '>inputUnion()' was accepted. The hook below is not installed until a
-    // 'union' rate divided slot needs it, so a patch file that declares the
-    // sampler and then resolves to divisor 1 hooks nothing at all
-    bool requested;
-
-    // -1 until the first 'union' slot installs the sampler hook
-    SceUID uid;
-    tai_hook_ref_t ref;
-
-    // Cleared before the hook is released. A disarmed sampler hook stops
-    // publishing and stops accumulating
-    volatile bool armed;
-
-    uint8_t segment;
-    uint32_t offset;
-    bool thumb;
-
-    // Where the pulse mask sits inside the pad structure the sampler takes as
-    // its first argument
-    uint32_t mask_offset;
-
-    // Divisor every 'union' slot shares. Two slots that divide differently
-    // cannot agree on which polls are live, so the second one is refused
-    uint32_t divisor;
-
-    // pad + mask_offset, published by the sampler hook from its own argument,
-    // so no global address is needed. NULL until the sampler has run once
-    uint32_t * volatile mask_addr;
-
-    // Residual of each of the last MAX_INPUT_UNION_RING polls, read at sampler
-    // entry - after every consumer of that poll has had its turn, so a mask
-    // some consumer swallowed contributes nothing, exactly as it does natively
-    volatile uint32_t ring[MAX_INPUT_UNION_RING];
-
-    // Polls written so far; the next one lands at head % MAX_INPUT_UNION_RING
-    volatile uint32_t head;
-} vg_input_hook_t;
 
 typedef struct {
     // OSD hook
@@ -233,19 +57,6 @@ typedef struct {
     // eboot hooks
     SceUID hook[MAX_HOOK_NUM];
     tai_hook_ref_t hook_ref[MAX_HOOK_NUM];
-
-    // eboot rate divided function hooks
-    uint32_t rate_hook_num;
-    vg_rate_hook_t rate_hook[MAX_RATE_HOOK_NUM];
-
-    // eboot input sampler hook, shared by the rate divided slots that asked
-    // for 'union'
-    vg_input_hook_t input;
-
-    // Displayed frame counter, the parity source for the rate divided hooks
-    // that asked for 'frame' counting. Folded back at RATE_COUNT_MODULUS, so
-    // the parity of every supported divisor survives the wrap.
-    volatile uint32_t frame;
 
 } vg_main_t;
 

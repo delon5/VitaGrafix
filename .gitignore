@@ -7,4 +7,3 @@ internal/
 tests/interpreter
 tests/test_interpreter
 tests/test_patchlist
-tests/test_hook

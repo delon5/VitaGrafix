@@ -217,33 +217,12 @@ int module_start(SceSize argc, const void *args) {
     for (int i = 0; i < MAX_HOOK_NUM; i++) {
         g_main.hook[i] = -1;
     }
-    g_main.rate_hook_num = 0;
-    g_main.frame = 0;
-    g_main.input.uid = -1;
-    g_main.input.armed = false;
-    g_main.input.requested = false;
-    g_main.input.divisor = 0;
-    g_main.input.mask_addr = NULL;
-    for (int i = 0; i < MAX_RATE_HOOK_NUM; i++) {
-        g_main.rate_hook[i].uid = -1;
-        g_main.rate_hook[i].armed = false;
-        g_main.rate_hook[i].divisor = 0;
-    }
 
     // Get eboot.bin info
     g_main.tai_info.size = sizeof(tai_module_info_t);
     g_main.sce_info.size = sizeof(SceKernelModuleInfo);
     taiGetModuleInfo(TAI_MAIN_MODULE, &g_main.tai_info);
-    // The segment table is what bounds a '>rateDivide()' hook target. A failed
-    // call leaves it zeroed, and a zeroed table now refuses every such target
-    // rather than installing it unchecked (see vg_hook_check_rate_target), so
-    // clear it explicitly and say so in the log instead of carrying on with
-    // whatever is in there.
-    int module_info_ret = sceKernelGetModuleInfo(g_main.tai_info.modid, &g_main.sce_info);
-    if (module_info_ret < 0) {
-        memset(&g_main.sce_info, 0, sizeof(g_main.sce_info));
-        g_main.sce_info.size = sizeof(SceKernelModuleInfo);
-    }
+    sceKernelGetModuleInfo(g_main.tai_info.modid, &g_main.sce_info);
 
     // Create VitaGrafix folder (if doesn't exist)
     sceIoMkdir(VG_DIR, 0777);
@@ -253,10 +232,6 @@ int module_start(SceSize argc, const void *args) {
     vg_log_printf("=======================================\n");
     vg_log_printf("[MAIN] Title ID: %s\n", g_main.titleid);
     vg_log_printf("[MAIN] SELF: %s\n", g_main.sce_info.path);
-    if (module_info_ret < 0) {
-        vg_log_printf("[MAIN] sceKernelGetModuleInfo failed (0x%X): no segment info,"
-                    " hook directives will be refused\n", module_info_ret);
-    }
     vg_log_printf("[MAIN] NID: 0x%X\n", g_main.tai_info.module_nid);
     vg_log_printf("=======================================\n");
 
@@ -342,39 +317,6 @@ int module_stop(SceSize argc, const void *args) {
             taiInjectRelease(g_main.inject[i - 1]);
     }
     g_main.inject_num = 0;
-
-    // Release rate divided game function hooks before the frame counter some
-    // of them read from, which lives in the hook[] array below.
-    //
-    // Disarm every slot first: a thread that is already inside a wrapper then
-    // takes the skipped path (which touches nothing that is being freed)
-    // instead of following a chain through a released ref. The window is the
-    // same one the OSD hook documents above and cannot be closed from here,
-    // but nothing is left pointing at freed memory on purpose.
-    for (uint32_t i = 0; i < g_main.rate_hook_num; i++) {
-        __atomic_store_n(&g_main.rate_hook[i].armed, false, __ATOMIC_RELEASE);
-    }
-    for (uint32_t i = g_main.rate_hook_num; i > 0; i--) {
-        if (g_main.rate_hook[i - 1].uid >= 0) {
-            taiHookRelease(g_main.rate_hook[i - 1].uid, g_main.rate_hook[i - 1].ref);
-            g_main.rate_hook[i - 1].uid = -1;
-            g_main.rate_hook[i - 1].divisor = 0;
-        }
-    }
-    g_main.rate_hook_num = 0;
-
-    // ...and the input sampler hook after them, since it is what they read the
-    // accumulated polls from. Disarmed first for the same reason: a call
-    // already on its way in then publishes nothing and accumulates nothing
-    // instead of following a chain that is being released.
-    if (g_main.input.uid >= 0) {
-        __atomic_store_n(&g_main.input.armed, false, __ATOMIC_RELEASE);
-        __atomic_store_n(&g_main.input.mask_addr, NULL, __ATOMIC_RELEASE);
-        taiHookRelease(g_main.input.uid, g_main.input.ref);
-        g_main.input.uid = -1;
-    }
-    g_main.input.requested = false;
-    g_main.input.divisor = 0;
 
     // Release game hooks, we need to loop the whole array since hooks are indexed by their id
     for (uint8_t i = MAX_HOOK_NUM; i > 0; i--) {

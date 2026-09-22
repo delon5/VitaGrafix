@@ -29,18 +29,6 @@ const char *vg_io_status_code_to_string(vg_io_status_code_t code) {
         case IO_ERROR_TOO_MANY_PATCHES: return "Too many patches, limit: " TOSTRING(MAX_INJECT_NUM);
         case IO_ERROR_TAI_PATCH_EXISTS: return "Memory already patched.";
         case IO_ERROR_TAI_GENERIC: return "Unknown TAI error.";
-        case IO_ERROR_TOO_MANY_HOOKS: return "Too many hooked functions, limit: " TOSTRING(MAX_RATE_HOOK_NUM);
-        case IO_ERROR_HOOK_WRONG_FEATURE: return "Hook directive outside of @FPS.";
-        case IO_ERROR_HOOK_CONFLICT: return "Conflicting hook directives for one address.";
-        case IO_ERROR_HOOK_BAD_DIVISOR: return "Rate divisor out of range, allowed: 1.." TOSTRING(RATE_DIVISOR_MAX);
-        case IO_ERROR_HOOK_BAD_TARGET: return "Hook target is not an instruction inside the module.";
-        case IO_ERROR_HOOK_UNSUPPORTED_ABI: return "Hook target ABI is not supported.";
-        case IO_ERROR_HOOK_NO_MODULE_INFO: return "No module segment info, hook target cannot be checked.";
-        case IO_ERROR_HOOK_BAD_MASK_OFFSET: return "Input mask offset is not a word inside the pad, allowed: 0.." TOSTRING(INPUT_MASK_OFFSET_MAX);
-        case IO_ERROR_HOOK_UNION_NEEDS_FRAME: return "'union' needs 'frame' counting.";
-        case IO_ERROR_HOOK_UNION_BAD_DIVISOR: return "'union' divisor out of range, allowed: 2.." TOSTRING(INPUT_UNION_DIVISOR_MAX);
-        case IO_ERROR_HOOK_UNION_NO_SAMPLER: return "'union' needs an '>inputUnion()' line before it.";
-        case IO_ERROR_HOOK_UNION_DIVISOR_CONFLICT: return "'union' slots do not all divide the same way.";
         default: return "?";
     }
 }
@@ -48,39 +36,6 @@ const char *vg_io_status_code_to_string(vg_io_status_code_t code) {
 bool vg_io_is_line_end(const char line[], int pos) {
     while (isspace(line[pos])) { pos++; }
     return line[pos] == '\0' || line[pos] == '#';
-}
-
-/**
- * Parses segment & offset (e.g. 0:0x12345) and leaves *pos on the first
- * character after the offset. The caller decides what may follow (whitespace
- * for a patch line, ',' or ')' inside a hook directive).
- */
-vg_io_status_t vg_io_parse_address(const char line[], int *pos, uint8_t *segment, uint32_t *offset) {
-
-    char *next = NULL;
-
-    // Parse segment
-    if (!isdigit(line[*pos]))
-        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
-    unsigned long segment_value = strtoul(&line[*pos], &next, 10); // always base 10
-    if (next == &line[*pos] || segment_value > UINT8_MAX)
-        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
-    if (*next != ':') {
-        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, next - line);
-    }
-    *segment = segment_value;
-    *pos = next - line + 1;
-
-    // Parse offset
-    if (!isdigit(line[*pos]))
-        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
-    unsigned long long offset_value = strtoull(&line[*pos], &next, 0);
-    if (next == &line[*pos] || offset_value > UINT32_MAX)
-        __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, *pos);
-    *offset = offset_value;
-    *pos = next - line;
-
-    __ret_status(IO_OK, 0, 0);
 }
 
 vg_io_status_t vg_io_parse_section_header(const char line[], vg_io_section_header_t *header) {

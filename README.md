@@ -5,8 +5,6 @@ VitaGrafix is a taiHEN plugin that allows you to change resolution and FPS cap o
 
 **For more information, visit the VitaGrafix wiki:** [HERE](https://github.com/Electry/VitaGrafix/wiki)
 
-**Patch file hook directives (`>`):** [docs/hook-directives.md](docs/hook-directives.md)
-
 <br>
 <br>
 

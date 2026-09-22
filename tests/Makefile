@@ -4,20 +4,13 @@ CFLAGS=-Wall -Wno-trigraphs -DBUILD_LEGACY_SUPPORT
 all: tests
 default: tests
 
-tests: test_interpreter test_patchlist test_hook
+tests: test_interpreter test_patchlist
 
 test_interpreter: test_interpreter.c interpreter.obj
 	$(CC) $(CFLAGS) test_interpreter.c $(interpreter_obj) -o test_interpreter -lm
 
-# Links the plugin's own hook directive parser, against the stub
-# vitasdk/taihen headers in stubs/, so that a '>' line in a patch file is
-# checked by the code that will run it
-test_patchlist: test_patchlist.c ../src/patch_hook.c ../src/io.c $(interpreter_src) $(interpreter_incl) ../src/patch_hook.h ../src/main.h
-	$(CC) $(CFLAGS) -Istubs test_patchlist.c ../src/patch_hook.c ../src/io.c $(interpreter_src) -o test_patchlist -lm
-
-# Hook directives, built against the stub vitasdk/taihen headers in stubs/
-test_hook: test_hook.c ../src/patch_hook.c ../src/io.c $(interpreter_src) $(interpreter_incl) ../src/patch_hook.h ../src/main.h
-	$(CC) $(CFLAGS) -Istubs test_hook.c ../src/patch_hook.c ../src/io.c $(interpreter_src) -o test_hook -lm
+test_patchlist: test_patchlist.c interpreter.obj
+	$(CC) $(CFLAGS) test_patchlist.c $(interpreter_obj) -o test_patchlist -lm
 
 interpreter_incl :=\
 	../src/interpreter/interpreter.h\
@@ -50,4 +43,4 @@ interpreter.obj: $(interpreter_src) $(interpreter_incl)
 	$(CC) $(CFLAGS) -c $(interpreter_src) -lm
 
 clean:
-	rm -f test_interpreter test_patchlist test_hook interpreter *.o
+	rm -f test_interpreter test_patchlist interpreter *.o

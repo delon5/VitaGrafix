@@ -86,14 +86,6 @@ typedef struct {
 
 intp_status_t intp_evaluate(const char *expression, uint32_t *pos, intp_value_t *value);
 
-/**
- * Evaluates one expression out of a bracketed, comma separated argument list.
- * Unlike intp_evaluate() a following ')' is not an error: evaluation stops on
- * it (and on ',') without consuming it, leaving *pos on the separator so the
- * caller can match it.
- */
-intp_status_t intp_evaluate_arg(const char *expression, uint32_t *pos, intp_value_t *value);
-
 void intp_set_vg_context(const intp_vg_context_t *context);
 const intp_vg_context_t *intp_get_vg_context();
 
