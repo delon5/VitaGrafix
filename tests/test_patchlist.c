@@ -141,7 +141,6 @@ static void write_result(unsigned int line_number, uint8_t segment,
  * Shader literal lines (gxp: / gxplit:), checked with the plugin's own parser
  */
 static vg_gxp_table_t g_gxp;
-static unsigned int g_gxp_lines[VG_GXP_MAX_PATCHES];   // file line of each table entry, by insertion order
 static bool g_expect_stock = false;
 static bool g_rules_only = false;
 
@@ -198,15 +197,16 @@ static bool handle_gxp_line(unsigned int line_number, const char *line) {
 
     l.rule.ordinal = (uint16_t)line_number;
     l.patch.ordinal = (uint16_t)line_number;
-    uint16_t before = g_gxp.count;
     vg_gxp_add_t ar = vg_gxp_table_add(&g_gxp, &l);
+    if (ar == VG_GXP_ADD_CHAIN) {
+        // The plugin drops such a rule at this resolution and goes on
+        fprintf(stdout, "%05u gxplit skipped: at this resolution it writes a word a rule looks for\n", line_number);
+        return ok;
+    }
     if (ar != VG_GXP_ADD_OK) {
-        fprintf(stdout, "%05u ERR %s\n", line_number, ar == VG_GXP_ADD_OVERLAP ? "overlap" : ar == VG_GXP_ADD_CHAIN
-                ? "chain" : "full");
+        fprintf(stdout, "%05u ERR %s\n", line_number, ar == VG_GXP_ADD_OVERLAP ? "overlap" : "full");
         return false;
     }
-    if (!rule && before < VG_GXP_MAX_PATCHES)
-        g_gxp_lines[before] = line_number;
     return ok;
 }
 
@@ -256,6 +256,35 @@ static unsigned int check_gxp_dir(const char *dir) {
             errors++;
             continue;
         }
+        uint32_t psize;
+        if (size < 12 || !vg_gxp_program_size(b, &psize) || psize > size) {
+            fprintf(stdout, "gxp:%08X ERR gxp-short (not a whole GXP program)\n", hash);
+            errors++;
+            free(b);
+            continue;
+        }
+        // Stock bytes and range of every line of this program, including those unchanged at this --ib
+        bool bad = false;
+        for (uint16_t k = i; k < g_gxp.count && g_gxp.e[k].hash == hash && !bad; k++) {
+            const vg_gxp_patch_t *e = &g_gxp.e[k];
+            if ((uint64_t)e->offset + e->size > psize) {
+                fprintf(stdout, "gxp:%08X ERR gxp-range +0x%X\n", hash, e->offset);
+                bad = true;
+                break;
+            }
+            for (uint8_t x = 0; x < e->size; x++) {
+                if (!(e->gap_mask & (1u << x)) && b[e->offset + x] != e->stock[x]) {
+                    fprintf(stdout, "gxp:%08X ERR gxp-stock +0x%X\n", hash, e->offset + x);
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if (bad) {
+            errors++;
+            free(b);
+            continue;
+        }
         vg_gxp_result_t r;
         vg_gxp_status_t st = vg_gxp_match(&g_gxp, b, &r);
         if (st == GXP_NOT_PROGRAM || r.hash != hash) {
@@ -293,6 +322,11 @@ static unsigned int check_gxp_dir(const char *dir) {
         uint8_t *b = load_file(path, &size);
         if (!b)
             continue;
+        uint32_t psize;
+        if (size < 12 || !vg_gxp_program_size(b, &psize) || psize > size) {
+            free(b);
+            continue;
+        }
         vg_gxp_result_t r;
         vg_gxp_status_t st = vg_gxp_match(&g_gxp, b, &r);
         if (st == GXP_RULE_MATCHED) {
@@ -414,6 +448,8 @@ int main(int argc, char *argv[]) {
 
         line[strcspn(line, "\r\n#")] = '\0';
         const char *patch_line = skip_ws(line);
+        if (*patch_line == '[' && !gxp_dir)
+            vg_gxp_table_reset(&g_gxp);   // each section has its own shader lines (--gxp-dir checks one game)
         if (!strncasecmp(patch_line, "gxp:", 4) || !strncasecmp(patch_line, "gxplit:", 7)) {
             patch_count++;
             if (!handle_gxp_line(line_number, patch_line))

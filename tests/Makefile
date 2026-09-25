@@ -12,11 +12,12 @@ test_interpreter: test_interpreter.c interpreter.obj
 test_patchlist: test_patchlist.c interpreter.obj patch_gxp_core.o
 	$(CC) $(CFLAGS) test_patchlist.c $(interpreter_obj) patch_gxp_core.o -o test_patchlist -lm
 
-test_gxp: test_gxp.c interpreter.obj patch_gxp_core.o
-	$(CC) $(CFLAGS) $(SANITIZE) test_gxp.c $(interpreter_obj) patch_gxp_core.o -o test_gxp -lm
+# test_gxp compiles the core itself, so TEST_SANITIZE=1 really instruments it
+test_gxp: test_gxp.c ../src/patch_gxp_core.c ../src/patch_gxp_core.h interpreter.obj
+	$(CC) $(CFLAGS) $(SANITIZE) test_gxp.c ../src/patch_gxp_core.c $(interpreter_obj) -o test_gxp -lm
 
 patch_gxp_core.o: ../src/patch_gxp_core.c ../src/patch_gxp_core.h $(interpreter_incl)
-	$(CC) $(CFLAGS) $(SANITIZE) -c ../src/patch_gxp_core.c -o patch_gxp_core.o
+	$(CC) $(CFLAGS) -c ../src/patch_gxp_core.c -o patch_gxp_core.o
 
 # Unit tests plus the shader-line fixtures (TEST_SANITIZE=1 builds test_gxp with ASan/UBSan)
 ifeq ($(TEST_SANITIZE),1)
@@ -29,6 +30,7 @@ check: test_interpreter test_patchlist test_gxp
 	./test_patchlist fixtures/gxp_lbp.txt --ib 720x408 --expect-stock
 	./test_patchlist fixtures/gxp_lbp.txt --ib 960x544 | diff - fixtures/gxp_lbp_960x544.expected
 	./test_patchlist fixtures/gxp_lbp.txt --ib 1280x720 | diff - fixtures/gxp_lbp_960x544.expected
+	IB_STEP=16 ./test_patchlist_configs.sh fixtures/gxp_lbp.txt
 
 interpreter_incl :=\
 	../src/interpreter/interpreter.h\

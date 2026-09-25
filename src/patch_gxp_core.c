@@ -225,7 +225,7 @@ vg_gxp_parse_t vg_gxp_parse_line(const char *src, vg_gxp_line_t *out, uint32_t *
         }
     } else {
         if ((uint64_t)out->patch.offset + size > VG_GXP_MAX_SIZE) {
-            *errpos = 4;
+            *errpos = 13;   // the offset
             return VG_GXP_PARSE_SYNTAX;
         }
         out->patch.size = size;
@@ -258,11 +258,32 @@ static bool rule_feeds(const vg_gxp_rule_t *w, const vg_gxp_rule_t *s) {
     return false;
 }
 
+// true when the stock runs of a and b could claim the same literal entry: at some shift the
+// overlapping words are equal (a == b included)
+static bool rules_overlap(const vg_gxp_rule_t *a, const vg_gxp_rule_t *b) {
+    for (int s = -(int)b->words + 1; s < (int)a->words; s++) {
+        bool same = true;
+        for (int j = 0; j < b->words && same; j++) {
+            int i = s + j;
+            if (i >= 0 && i < a->words)
+                same = a->stock[i] == b->stock[j];
+        }
+        if (same)
+            return true;
+    }
+    return false;
+}
+
 vg_gxp_add_t vg_gxp_table_add(vg_gxp_table_t *t, const vg_gxp_line_t *line) {
     if (line->kind == VG_GXP_LINE_RULE) {
         const vg_gxp_rule_t *n = &line->rule;
         if (t->rule_count >= VG_GXP_MAX_RULES)
             return VG_GXP_ADD_FULL;
+        // Two rules that can claim the same entries would cancel each other on every program
+        for (uint8_t i = 0; i < t->rule_count; i++) {
+            if (rules_overlap(n, &t->r[i]))
+                return VG_GXP_ADD_OVERLAP;
+        }
         // A word a rule writes must never be a word a rule looks for, or a buffer registered
         // again could be rewritten twice
         if (rule_feeds(n, n))

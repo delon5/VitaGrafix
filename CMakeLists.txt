@@ -11,7 +11,9 @@ endif()
 project(VitaGrafix)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O3 -std=gnu99")
+# -O2, not -O3: at -O3 .text ends a few hundred bytes below the 64 KiB boundary where the data
+# segment starts, and vita-elf-create then has no room for its SCE data at the end of segment 0
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wall -O2 -std=gnu99")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fno-rtti -fno-exceptions")
 
 # add_definitions(-DENABLE_VERBOSE_LOGGING)

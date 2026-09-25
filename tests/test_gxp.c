@@ -194,6 +194,25 @@ static void test_table(void) {
     parse("gxplit: uint32(1).uint32(2) => uint32(3).uint32(1)", &l, &pos);
     CHECK(vg_gxp_table_add(&t, &l) == VG_GXP_ADD_CHAIN, "a rule writing a word it looks for itself");
 
+    // Rules whose stock runs can claim the same entries
+    vg_gxp_table_reset(&t);
+    CHECK(add(&t, "gxplit: uint32(1).uint32(2) => uint32(3).uint32(4)"), "rule a again");
+    parse("gxplit: uint32(1).uint32(2) => uint32(5).uint32(6)", &l, &pos);
+    CHECK(vg_gxp_table_add(&t, &l) == VG_GXP_ADD_OVERLAP, "identical stock run");
+    parse("gxplit: uint32(2).uint32(7) => uint32(8).uint32(9)", &l, &pos);
+    CHECK(vg_gxp_table_add(&t, &l) == VG_GXP_ADD_OVERLAP, "stock runs overlapping by one word");
+    parse("gxplit: uint32(2) => uint32(10)", &l, &pos);
+    CHECK(vg_gxp_table_add(&t, &l) == VG_GXP_ADD_OVERLAP, "a one-word run inside another");
+    parse("gxplit: uint32(7).uint32(8) => uint32(11).uint32(12)", &l, &pos);
+    CHECK(vg_gxp_table_add(&t, &l) == VG_GXP_ADD_OK, "unrelated run accepted");
+
+    // At ib width 408 the first LBP rule would write 1/408, a word it looks for: a chain
+    set_ib(408, 544);
+    parse("gxplit: fl32(1.0/720).fl32(1.0/408) => fl32(1.0/min(ib_w, 960)).fl32(1.0/min(ib_h, 544))", &l, &pos);
+    vg_gxp_table_reset(&t);
+    CHECK(vg_gxp_table_add(&t, &l) == VG_GXP_ADD_CHAIN, "LBP rule 1 at width 408 is a chain (the plugin skips it)");
+    set_ib(960, 544);
+
     // At ib 720x544 only 1/H changes: the three LBP rules must still be accepted together
     set_ib(720, 544);
     vg_gxp_table_reset(&t);
@@ -337,8 +356,15 @@ static void test_rules(void) {
     // Conflicting runs
     vg_gxp_table_t c;
     vg_gxp_table_reset(&c);
-    add(&c, "gxplit: uint32(1).uint32(2) => uint32(10).uint32(20)");
-    add(&c, "gxplit: uint32(2).uint32(3) => uint32(30).uint32(40)");
+    CHECK(add(&c, "gxplit: uint32(1).uint32(2) => uint32(10).uint32(20)")
+          && !add(&c, "gxplit: uint32(2).uint32(3) => uint32(30).uint32(40)"), "overlapping rules rejected when added");
+    // The matcher still refuses to write when two runs share an entry (table built directly)
+    c.r[1].words = 2;
+    c.r[1].stock[0] = 2;
+    c.r[1].stock[1] = 3;
+    c.r[1].data[0] = 30;
+    c.r[1].data[1] = 40;
+    c.rule_count = 2;
     vg_gxp_table_seal(&c);
     uint32_t regs4[] = {0, 1, 2};
     uint32_t vals4[] = {1, 2, 3};

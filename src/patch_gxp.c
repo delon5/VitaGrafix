@@ -31,6 +31,8 @@ static uint8_t g_gxp_misc_lines;
 static bool g_gxp_suppressed;
 static uint32_t g_gxp_rule_logged[GXP_RULE_LOG_MAX];
 static uint8_t g_gxp_rule_logged_count;
+static uint32_t g_gxp_survey_logged[GXP_RULE_LOG_MAX];
+static uint8_t g_gxp_survey_logged_count;
 
 void vg_gxp_reset() {
     vg_gxp_table_reset(&g_gxp);
@@ -76,7 +78,7 @@ vg_io_status_t vg_gxp_parse_patch(const char line[]) {
     if (l.kind == VG_GXP_LINE_RULE) {
         l.rule.ordinal = g_gxp_ordinal;
         if (pr == VG_GXP_PARSE_UNCHANGED) {
-            vg_log_printf("[PATCH] Skipped gxplit rule %u, value is stock\n", g_gxp_ordinal);
+            vg_log_printf("[PATCH] Skipped gxplit rule %u (shader line %u), value is stock\n", g_gxp_ordinal, g_gxp_ordinal);
             __ret_status(IO_OK, 0, 0);
         }
     } else {
@@ -89,11 +91,14 @@ vg_io_status_t vg_gxp_parse_patch(const char line[]) {
         case VG_GXP_ADD_FULL:
             __ret_status(IO_ERROR_TOO_MANY_GXP_PATCHES, 0, 0);
         case VG_GXP_ADD_OVERLAP:
-            vg_log_printf("[PATCH] Shader patch overlaps an earlier line for the same program\n");
+            vg_log_printf(l.kind == VG_GXP_LINE_RULE ? "[PATCH] gxplit rule can match the same literals as an earlier rule\n"
+                                                     : "[PATCH] Shader patch overlaps an earlier line for the same program\n");
             __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, 0);
         case VG_GXP_ADD_CHAIN:
-            vg_log_printf("[PATCH] gxplit rule writes words another rule looks for (or the reverse)\n");
-            __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, 0);
+            // Depends on the resolution (e.g. W = 408 makes 1/W a stock word): drop this rule only
+            vg_log_printf("[PATCH] Skipped gxplit rule %u at this resolution: it would write a word a rule looks for\n",
+                          l.rule.ordinal);
+            __ret_status(IO_OK, 0, 0);
     }
 
     if (l.kind == VG_GXP_LINE_RULE) {
@@ -163,7 +168,25 @@ static bool vg_gxp_may_log(const vg_gxp_result_t *r) {
     return false;
 }
 
+// true the first time this session sees the hash in the list (false also when the list is full)
+static bool first_time(uint32_t *list, uint8_t *count, uint32_t hash) {
+    for (uint8_t i = 0; i < *count; i++) {
+        if (list[i] == hash)
+            return false;
+    }
+    if (*count >= GXP_RULE_LOG_MAX)
+        return false;
+    list[(*count)++] = hash;
+    return true;
+}
+
+// Problem lines are rare and capped, and are flushed at once: when nothing gets patched they
+// are the only way to tell why (lock held)
 static void vg_gxp_log_problem(const void *prog, const vg_gxp_result_t *r, const char *what) {
+    // A program with a stock literal but no rule is reported once, whatever its reloads
+    if (r->status == GXP_SURVEY
+            && !first_time(g_gxp_survey_logged, &g_gxp_survey_logged_count, r->hash))
+        return;
     if (!vg_gxp_may_log(r))
         return;
     switch (r->status) {
@@ -191,6 +214,7 @@ static void vg_gxp_log_problem(const void *prog, const vg_gxp_result_t *r, const
             vg_log_printf("[GXP] %08X at 0x%08X (%u bytes): %s\n", r->hash, (uint32_t)prog, r->size, what);
             break;
     }
+    vg_log_flush();
 }
 
 static void vg_gxp_log_patched(const void *prog, const vg_gxp_result_t *r) {
@@ -203,23 +227,18 @@ static void vg_gxp_log_patched(const void *prog, const vg_gxp_result_t *r) {
             vg_log_flush();
         } else if (n == 2) {
             vg_log_printf("[GXP] Patched %08X again at 0x%08X\n", r->hash, (uint32_t)prog);
+            vg_log_flush();
         }
         return;
     }
 
     // Value rule: a program the patch file does not list yet
-    for (uint8_t i = 0; i < g_gxp_rule_logged_count; i++) {
-        if (g_gxp_rule_logged[i] == r->hash)
-            return;
-    }
-    if (g_gxp_rule_logged_count >= GXP_RULE_LOG_MAX)
+    if (!first_time(g_gxp_rule_logged, &g_gxp_rule_logged_count, r->hash))
         return;
-    g_gxp_rule_logged[g_gxp_rule_logged_count++] = r->hash;
-    vg_log_printf("[GXP] Rule %u patched %08X at 0x%08X (%u bytes):", g_gxp.r[r->site[0].rule].ordinal,
-                  r->hash, (uint32_t)prog, r->size);
+    vg_log_printf("[GXP] Value rules patched %08X at 0x%08X (%u bytes):", r->hash, (uint32_t)prog, r->size);
     for (uint8_t s = 0; s < r->nsite; s++)
-        vg_log_printf(" +0x%X", r->site[s].offset + 4);
-    vg_log_printf(" (not in the hash list, please report)\n");
+        vg_log_printf(" +0x%X (rule %u)", r->site[s].offset + 4, g_gxp.r[r->site[s].rule].ordinal);
+    vg_log_printf(" - not in the hash list, please report\n");
     vg_log_flush();
 }
 
@@ -231,9 +250,11 @@ static void vg_gxp_apply(void *prog, vg_gxp_result_t *r) {
 
     lock();
     if (!mapped || !writable) {
-        if (vg_gxp_may_log(r))
+        if (vg_gxp_may_log(r)) {
             vg_log_printf("[GXP] %08X at 0x%08X (%u bytes): not writable (rc 0x%08X, access 0x%X); nothing written\n",
                           r->hash, (uint32_t)prog, r->size, rc, access);
+            vg_log_flush();
+        }
     } else {
         // Another thread may have registered the same buffer since the match
         vg_gxp_status_t st = vg_gxp_recheck(&g_gxp, prog, r);
@@ -258,7 +279,17 @@ static int vg_gxp_hook_register(SceGxmShaderPatcher *shaderPatcher, const SceGxm
         int rc;
         uint32_t access;
         // Hash only a program that lies in mapped memory
-        if (vg_gxp_mapped(programHeader, size, &writable, &rc, &access)) {
+        if (!vg_gxp_mapped(programHeader, size, &writable, &rc, &access)) {
+            vg_gxp_result_t r;
+            memset(&r, 0, sizeof(r));   // not hashed: counts as an unnamed program for the caps
+            lock();
+            if (vg_gxp_may_log(&r)) {
+                vg_log_printf("[GXP] Program at 0x%08X (%u bytes) is not inside one mapped block (rc 0x%08X); "
+                              "not checked\n", (uint32_t)programHeader, size, rc);
+                vg_log_flush();
+            }
+            unlock();
+        } else {
             vg_gxp_result_t r;
             vg_gxp_status_t st = vg_gxp_match(&g_gxp, programHeader, &r);
             if (st == GXP_MATCHED || st == GXP_RULE_MATCHED) {
@@ -286,6 +317,7 @@ vg_io_status_t vg_gxp_install() {
     g_gxp_misc_lines = 0;
     g_gxp_suppressed = false;
     g_gxp_rule_logged_count = 0;
+    g_gxp_survey_logged_count = 0;
 
     g_gxp_lock_ok = sceKernelCreateLwMutex(&g_gxp_lock, "VitaGrafixGxp", 0, 0, NULL) >= 0;
     if (!g_gxp_lock_ok) {
