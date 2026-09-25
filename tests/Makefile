@@ -4,13 +4,31 @@ CFLAGS=-Wall -Wno-trigraphs -DBUILD_LEGACY_SUPPORT
 all: tests
 default: tests
 
-tests: test_interpreter test_patchlist
+tests: test_interpreter test_patchlist test_gxp
 
 test_interpreter: test_interpreter.c interpreter.obj
 	$(CC) $(CFLAGS) test_interpreter.c $(interpreter_obj) -o test_interpreter -lm
 
-test_patchlist: test_patchlist.c interpreter.obj
-	$(CC) $(CFLAGS) test_patchlist.c $(interpreter_obj) -o test_patchlist -lm
+test_patchlist: test_patchlist.c interpreter.obj patch_gxp_core.o
+	$(CC) $(CFLAGS) test_patchlist.c $(interpreter_obj) patch_gxp_core.o -o test_patchlist -lm
+
+test_gxp: test_gxp.c interpreter.obj patch_gxp_core.o
+	$(CC) $(CFLAGS) $(SANITIZE) test_gxp.c $(interpreter_obj) patch_gxp_core.o -o test_gxp -lm
+
+patch_gxp_core.o: ../src/patch_gxp_core.c ../src/patch_gxp_core.h $(interpreter_incl)
+	$(CC) $(CFLAGS) $(SANITIZE) -c ../src/patch_gxp_core.c -o patch_gxp_core.o
+
+# Unit tests plus the shader-line fixtures (TEST_SANITIZE=1 builds test_gxp with ASan/UBSan)
+ifeq ($(TEST_SANITIZE),1)
+SANITIZE=-fsanitize=address,undefined -g
+endif
+
+check: test_interpreter test_patchlist test_gxp
+	./test_interpreter
+	./test_gxp
+	./test_patchlist fixtures/gxp_lbp.txt --ib 720x408 --expect-stock
+	./test_patchlist fixtures/gxp_lbp.txt --ib 960x544 | diff - fixtures/gxp_lbp_960x544.expected
+	./test_patchlist fixtures/gxp_lbp.txt --ib 1280x720 | diff - fixtures/gxp_lbp_960x544.expected
 
 interpreter_incl :=\
 	../src/interpreter/interpreter.h\
@@ -43,4 +61,4 @@ interpreter.obj: $(interpreter_src) $(interpreter_incl)
 	$(CC) $(CFLAGS) -c $(interpreter_src) -lm
 
 clean:
-	rm -f test_interpreter test_patchlist interpreter *.o
+	rm -f test_interpreter test_patchlist test_gxp interpreter *.o

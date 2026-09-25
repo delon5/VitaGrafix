@@ -17,7 +17,7 @@
 #define STRING_BUFFER_SIZE 1024
 
 #define MAX_INJECT_NUM 1024
-#define MAX_HOOK_NUM   3
+#define MAX_HOOK_NUM   4
 
 #define TITLEID_ANY  "XXXXxxxxx"
 

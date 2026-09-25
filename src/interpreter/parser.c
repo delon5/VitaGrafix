@@ -72,6 +72,7 @@ const token_t _TOKENS[TOKEN_INVALID + 1] = {
     {52, "uint16",    TOKEN_RAW_UINT16,            TOKEN_ARITY_1,  OP_UNARY(op_datatype_raw_uint16)},
     {52, "uint32",    TOKEN_RAW_UINT32,            TOKEN_ARITY_1,  OP_UNARY(op_datatype_raw_uint32)},
     {52, "fl32",      TOKEN_RAW_FL32,              TOKEN_ARITY_1,  OP_UNARY(op_datatype_raw_fl32)},
+    {52, "fl16",      TOKEN_RAW_FL16,              TOKEN_ARITY_1,  OP_UNARY(op_datatype_raw_fl16)},
     {52, "rawn",      TOKEN_RAW_RAWN,              TOKEN_ARITY_2,  OP_BINARY(op_datatype_raw_bytes_n)},
     {52, "raw",       TOKEN_RAW_RAW,               TOKEN_ARITY_1,  OP_UNARY(op_datatype_raw_bytes)},
 #ifdef BUILD_LEGACY_SUPPORT
@@ -83,6 +84,7 @@ const token_t _TOKENS[TOKEN_INVALID + 1] = {
     {51, "int",       TOKEN_CAST_INT,              TOKEN_ARITY_1,  OP_UNARY(op_datatype_cast_int)},
     {51, "uint",      TOKEN_CAST_UINT,             TOKEN_ARITY_1,  OP_UNARY(op_datatype_cast_uint)},
     {51, "float",     TOKEN_CAST_FLOAT,            TOKEN_ARITY_1,  OP_UNARY(op_datatype_cast_float)},
+    {51, "half",      TOKEN_CAST_HALF,             TOKEN_ARITY_1,  OP_UNARY(op_datatype_cast_half)},
 
     {90, "pi",        TOKEN_CONST_PI,              TOKEN_CONSTANT, OP_UNARY(op_math_const_pi)},
     {90, "e",         TOKEN_CONST_E,               TOKEN_CONSTANT, OP_UNARY(op_math_const_e)},

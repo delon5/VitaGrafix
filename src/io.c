@@ -27,6 +27,7 @@ const char *vg_io_status_code_to_string(vg_io_status_code_t code) {
         case IO_ERROR_PARSE_INVALID_TOKEN: return "Invalid token.";
         case IO_ERROR_INTERPRETER_ERROR: return "Interpreter error.";
         case IO_ERROR_TOO_MANY_PATCHES: return "Too many patches, limit: " TOSTRING(MAX_INJECT_NUM);
+        case IO_ERROR_TOO_MANY_GXP_PATCHES: return "Too many shader patches or rules.";
         case IO_ERROR_TAI_PATCH_EXISTS: return "Memory already patched.";
         case IO_ERROR_TAI_GENERIC: return "Unknown TAI error.";
         default: return "?";

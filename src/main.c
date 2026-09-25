@@ -9,6 +9,7 @@
 #include "log.h"
 #include "config.h"
 #include "patch.h"
+#include "patch_gxp.h"
 #include "main.h"
 #include "osd.h"
 
@@ -323,6 +324,9 @@ int module_stop(SceSize argc, const void *args) {
         if (g_main.hook[i - 1] >= 0)
             taiHookRelease(g_main.hook[i - 1], g_main.hook_ref[i - 1]);
     }
+
+    // The shader hook is gone: its lock can go too
+    vg_gxp_uninstall();
 
     return SCE_KERNEL_STOP_SUCCESS;
 }

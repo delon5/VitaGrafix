@@ -1,0 +1,35 @@
+# Shader literal lines of the LittleBigPlanet PS Vita patch (hashes, offsets and expressions only)
+[PCSA00549, eboot.bin, 0x91ABDB4F]
+@IB
+# Shader literals (second @IB block, so an older VitaGrafix still applies every line above).
+# W = min(ib_w, 960), H = min(ib_h, 544): the size of the render target the eboot lines create.
+# Each program computes uv = gl_FragCoord.xy * (1/720, 1/408). Offsets are inside the GXP.
+# PostDoF composites: 842CD7E0/CEDDB385/ABC51E1D hold 1/720 as a half widened to f32,
+# 0350976F (smoke/fire) holds (1/720, 1/408) as a packed pair of halves.
+gxp:842CD7E0:0x1C4 fl32(half(1.0/720)) => fl32(half(1.0/min(ib_w, 960)))
+gxp:842CD7E0:0x1CC fl32(1.0/408) => fl32(1.0/min(ib_h, 544))
+gxp:CEDDB385:0x1C4 fl32(half(1.0/720)) => fl32(half(1.0/min(ib_w, 960)))
+gxp:CEDDB385:0x1CC fl32(1.0/408) => fl32(1.0/min(ib_h, 544))
+gxp:0350976F:0x324 fl16(1.0/720).fl16(1.0/408) => fl16(1.0/min(ib_w, 960)).fl16(1.0/min(ib_h, 544))
+gxp:ABC51E1D:0x250 fl32(half(1.0/720)) => fl32(half(1.0/min(ib_w, 960)))
+gxp:ABC51E1D:0x258 fl32(1.0/408) => fl32(1.0/min(ib_h, 544))
+# Main-scene materials that refract the colour buffer (cbuf, texture unit 15)
+gxp:0C30ACBB:0x298 fl32(1.0/720) => fl32(1.0/min(ib_w, 960))
+gxp:0C30ACBB:0x2A0 fl32(1.0/408) => fl32(1.0/min(ib_h, 544))
+gxp:28EA0046:0x2B8 fl32(1.0/720) => fl32(1.0/min(ib_w, 960))
+gxp:28EA0046:0x2C0 fl32(1.0/408) => fl32(1.0/min(ib_h, 544))
+gxp:6369657B:0x2F0 fl32(1.0/720) => fl32(1.0/min(ib_w, 960))
+gxp:6369657B:0x2F8 fl32(1.0/408) => fl32(1.0/min(ib_h, 544))
+gxp:924AAAC6:0x260 fl32(1.0/720) => fl32(1.0/min(ib_w, 960))
+gxp:924AAAC6:0x268 fl32(1.0/408) => fl32(1.0/min(ib_h, 544))
+gxp:98D34068:0x300 fl32(1.0/720) => fl32(1.0/min(ib_w, 960))
+gxp:98D34068:0x308 fl32(1.0/408) => fl32(1.0/min(ib_h, 544))
+gxp:E6E1B555:0x328 fl32(1.0/720) => fl32(1.0/min(ib_w, 960))
+gxp:E6E1B555:0x330 fl32(1.0/408) => fl32(1.0/min(ib_h, 544))
+# Other permutations of the same shaders: the same three literal forms, matched by value in
+# consecutive literal registers of any program not listed above
+gxplit: fl32(1.0/720).fl32(1.0/408) => fl32(1.0/min(ib_w, 960)).fl32(1.0/min(ib_h, 544))
+gxplit: fl32(half(1.0/720)).fl32(1.0/408) => fl32(half(1.0/min(ib_w, 960))).fl32(1.0/min(ib_h, 544))
+gxplit: fl16(1.0/720).fl16(1.0/408) => fl16(1.0/min(ib_w, 960)).fl16(1.0/min(ib_h, 544))
+# Touch ripple (medium confidence): 0.56 maps the 1280x720 touch canvas to 720x408 render pixels
+gxp:BA5708B2:0x3B0 fl32(0.56) => fl32(0.56 * (min(ib_w, 960) / 720.0))

@@ -28,6 +28,8 @@ add_executable(VitaGrafix
   src/config.c
   src/patch.c
   src/patch_hook.c
+  src/patch_gxp.c
+  src/patch_gxp_core.c
 #  src/patch_sig.c
   src/interpreter/interpreter.c
   src/interpreter/parser.c
@@ -45,6 +47,7 @@ target_link_libraries(VitaGrafix
   SceCtrl_stub
   SceKernelModulemgr_stub
   SceLibKernel_stub
+  SceSysmem_stub
   SceIofilemgr_stub
   SceLibc_stub
   gcc

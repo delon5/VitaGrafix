@@ -24,7 +24,7 @@ int vg_hook_sceCtrlReadBufferPositive2_peekPatched(int port, SceCtrlData *pad_da
     return sceCtrlPeekBufferPositive2(port, pad_data, count);
 }
 
-static vg_io_status_t vg_hook_function_import(vg_hook_id_t hook_id, uint32_t nid, const void *func) {
+vg_io_status_t vg_hook_function_import(vg_hook_id_t hook_id, uint32_t nid, const void *func) {
     // Each hook has exactly one slot. Hooking the same import twice would
     // overwrite the first hook's uid/ref (leaking it, and making its
     // TAI_CONTINUE re-enter the hook forever), so treat a repeat as a no-op.

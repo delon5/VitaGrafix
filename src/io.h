@@ -28,6 +28,7 @@ typedef enum {
 
     // Patcher error
     IO_ERROR_TOO_MANY_PATCHES,
+    IO_ERROR_TOO_MANY_GXP_PATCHES,
     IO_ERROR_TAI_PATCH_EXISTS,
     IO_ERROR_TAI_GENERIC,
 

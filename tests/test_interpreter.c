@@ -235,6 +235,28 @@ const intp_testcase_t _TESTS[] = {
     {"fl32(1)",            {0x00, 0x00, 0x80, 0x3F},  4, DATA_TYPE_RAW},
     {"fl32(1.0)",          {0x00, 0x00, 0x80, 0x3F},  4, DATA_TYPE_RAW},
     {"fl32(pi)",           {0xDB, 0x0F, 0x49, 0x40},  4, DATA_TYPE_RAW},
+    {"fl16(1.0/720)",      {0xB0, 0x15},              2, DATA_TYPE_RAW},
+    {"fl16(1.0/408)",      {0x05, 0x19},              2, DATA_TYPE_RAW},
+    {"fl16(1.0/960)",      {0x44, 0x14},              2, DATA_TYPE_RAW},
+    {"fl16(408)",          {0x60, 0x5E},              2, DATA_TYPE_RAW},
+    {"fl16(544)",          {0x40, 0x60},              2, DATA_TYPE_RAW},
+    {"fl16(1)",            {0x00, 0x3C},              2, DATA_TYPE_RAW},
+    {"fl16(-2)",           {0x00, 0xC0},              2, DATA_TYPE_RAW},
+    {"fl16(0.5).fl16(0.5)", {0x00, 0x38, 0x00, 0x38}, 4, DATA_TYPE_RAW},
+    {"fl16(65504)",        {0xFF, 0x7B},              2, DATA_TYPE_RAW},
+    {"fl16(65519)",        {0xFF, 0x7B},              2, DATA_TYPE_RAW},
+    {"fl16(2049)",         {0x00, 0x68},              2, DATA_TYPE_RAW},
+    {"fl16(2051)",         {0x02, 0x68},              2, DATA_TYPE_RAW},
+    {"fl16(0.000000059604645)", {0x01, 0x00},         2, DATA_TYPE_RAW},
+    {"fl16(0.00000002)",   {0x00, 0x00},              2, DATA_TYPE_RAW},
+    {"fl16(-0.0)",         {0x00, 0x80},              2, DATA_TYPE_RAW},
+    {"fl16(0.00006103515625)", {0x00, 0x04},          2, DATA_TYPE_RAW},
+    {"fl16(0.00006097555)", {0xFF, 0x03},             2, DATA_TYPE_RAW},
+    {"fl32(half(1.0/720))", {0x00, 0x00, 0xB6, 0x3A}, 4, DATA_TYPE_RAW},
+    {"fl32(half(1.0/960))", {0x00, 0x80, 0x88, 0x3A}, 4, DATA_TYPE_RAW},
+    {"fl32(1.0/408)",      {0xA1, 0xA0, 0x20, 0x3B},  4, DATA_TYPE_RAW},
+    {"half(1.0/3)",        {0x00, 0xA0, 0xAA, 0x3E},  INTP_PRIMITIVE_SIZE, DATA_TYPE_FLOAT},
+    {"half(0.000000059604645)", {0x00, 0x00, 0x80, 0x33}, INTP_PRIMITIVE_SIZE, DATA_TYPE_FLOAT},
 #ifdef BUILD_LEGACY_SUPPORT
     {"bytes(pi)",          {0xDB, 0x0F, 0x49, 0x40},  4, DATA_TYPE_RAW},
     {"bytes(DEADBEEFr)",   {0xDE, 0xAD, 0xBE, 0xEF},  4, DATA_TYPE_RAW},
@@ -379,6 +401,11 @@ const intp_testcase_t _TESTS_VG_CONTEXT[] = {
 };
 
 const intp_error_testcase_t _TESTS_ERROR[] = {
+    // Half precision out of range
+    {"fl16(65520)",  INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
+    {"half(70000)",  INTP_STATUS_ERROR_INVALID_DATATYPE, 0},
+    {"fl16()",       INTP_STATUS_ERROR_TOO_FEW_ARGS, 5},
+    {"fl16(1,2)",    INTP_STATUS_ERROR_TOO_MANY_ARGS, 6},
     // Invalid token
     {"abcd",         INTP_STATUS_ERROR_INVALID_TOKEN, 0},
     {"   abcd",      INTP_STATUS_ERROR_INVALID_TOKEN, 3},

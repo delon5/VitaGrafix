@@ -47,6 +47,7 @@ bool op_datatype_raw_uint8(value_t *lhs);
 bool op_datatype_raw_uint16(value_t *lhs);
 bool op_datatype_raw_uint32(value_t *lhs);
 bool op_datatype_raw_fl32(value_t *lhs);
+bool op_datatype_raw_fl16(value_t *lhs);
 bool op_datatype_raw_bytes(value_t *lhs);
 bool op_datatype_raw_bytes_n(value_t *lhs, value_t *rhs);
 
@@ -55,6 +56,7 @@ bool op_datatype_raw_concat(value_t *lhs, value_t *rhs);
 bool op_datatype_cast_int(value_t *lhs);
 bool op_datatype_cast_uint(value_t *lhs);
 bool op_datatype_cast_float(value_t *lhs);
+bool op_datatype_cast_half(value_t *lhs);
 
 bool op_encode_t1_mov(value_t *out, value_t *value);
 bool op_encode_t2_mov(value_t *out, value_t *setflags, value_t *value);

@@ -9,6 +9,7 @@
 #include "config.h"
 #include "patch.h"
 #include "patch_hook.h"
+#include "patch_gxp.h"
 #ifdef BUILD_SIG_SUPPORT
 #include "patch_sig.h"
 #endif
@@ -296,6 +297,11 @@ static vg_io_status_t vg_patch_parse_line(const char line[]) {
         if (g_patch_feature != FEATURE_INVALID
                 && vg_config_is_feature_enabled(g_patch_feature)) {
 
+            // Parse shader literal patch
+            if (!strncasecmp(line, "gxp:", 4) || !strncasecmp(line, "gxplit:", 7)) {
+                return vg_gxp_parse_patch(line);
+            }
+
             // Parse hook
             if (line[0] == '>') {
                 return vg_hook_parse_patch(line);
@@ -326,6 +332,7 @@ vg_io_status_t vg_patch_parse_and_apply() {
     }
 
     vg_patch_set_interpreter_context();
+    vg_gxp_reset();
 
     SceUInt32 start = sceKernelGetProcessTimeLow();
     char path[128];
@@ -369,6 +376,12 @@ vg_io_status_t vg_patch_parse_and_apply() {
         vg_log_printf("[PATCH] Patched %u bytes in %d patches and it took %ums\n",
                         g_patch_applied_size, g_main.inject_num, (end - start) / 1000);
     }
+
+    // Shader literal patches are applied later, when the game registers each program.
+    // Like injects, the lines queued before a parse failure stay active.
+    vg_io_status_t gxp_status = vg_gxp_install();
+    if (gxp_status.code != IO_OK && g_patch_status.code == IO_OK)
+        g_patch_status = gxp_status;
 
     // Mark features as unsupported (those for which patches haven't been found)
     vg_config_apply_patch_capabilities(g_patch_support);
