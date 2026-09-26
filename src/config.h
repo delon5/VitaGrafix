@@ -99,8 +99,19 @@ vg_io_status_t vg_config_parse();
 
 vg_config_t *vg_config_get();
 const vg_io_status_t *vg_config_get_status();
+const char *vg_config_get_error_path();
 
-bool vg_config_save_current_title_override();
+// Saving the in-game menu's settings to config/<TITLEID>.txt
+typedef enum {
+    CONFIG_SAVE_IDLE,
+    CONFIG_SAVE_RUNNING,
+    CONFIG_SAVE_OK,
+    CONFIG_SAVE_FAILED
+} vg_config_save_state_t;
+
+bool vg_config_save_start();
+vg_config_save_state_t vg_config_save_get_state();
+void vg_config_save_wait();
 
 bool vg_config_is_feature_enabled(vg_feature_t feature);
 bool vg_config_is_feature_supported(vg_feature_t feature);

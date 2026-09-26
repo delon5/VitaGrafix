@@ -6,6 +6,7 @@
 #include "io.h"
 #include "log.h"
 #include "config.h"
+#include "menu.h"
 #include "patch.h"
 #include "patch_hook.h"
 #include "main.h"
@@ -16,12 +17,18 @@ int vg_hook_sceDisplaySetFrameBuf_withWait(const SceDisplayFrameBuf *pParam, int
     return ret;
 }
 
+// These replace the import instead of continuing the hook chain, so the
+// in-game menu's input hook on the same import never runs: filter here too
 int vg_hook_sceCtrlReadBufferPositive_peekPatched(int port, SceCtrlData *pad_data, int count) {
-    return sceCtrlPeekBufferPositive(port, pad_data, count);
+    int ret = sceCtrlPeekBufferPositive(port, pad_data, count);
+    vg_menu_filter_ctrl(pad_data, ret < count ? ret : count, false);
+    return ret;
 }
 
 int vg_hook_sceCtrlReadBufferPositive2_peekPatched(int port, SceCtrlData *pad_data, int count) {
-    return sceCtrlPeekBufferPositive2(port, pad_data, count);
+    int ret = sceCtrlPeekBufferPositive2(port, pad_data, count);
+    vg_menu_filter_ctrl(pad_data, ret < count ? ret : count, false);
+    return ret;
 }
 
 vg_io_status_t vg_hook_function_import(vg_hook_id_t hook_id, uint32_t nid, const void *func) {

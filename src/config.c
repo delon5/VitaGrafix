@@ -155,7 +155,6 @@ static vg_io_status_t vg_config_parse_internal_buffer_resolution(const char line
         __ret_status(IO_OK, 0, 0);
     }
 
-    *count = 0;
     while (true) {
         if (*count >= MAX_RES_COUNT)
             __ret_status(IO_ERROR_PARSE_INVALID_TOKEN, 0, pos);
@@ -373,14 +372,42 @@ void vg_config_propagate_ib() {
     }
 }
 
-static bool vg_config_write_section_separator(SceUID fd, bool output_has_data, char last_output_char) {
-    if (!output_has_data) {
-        return true;
-    }
+// Saving the in-game menu's settings
+//
+// Each title's settings live in config/<TITLEID>.txt, which is used instead of config.txt
+// when it exists (config.txt is the fallback, like patchlist.txt for the patch folder).
+// VitaGrafixConfigurator writes the same files. A save puts the menu's options into the
+// last part of that file the running game reads (the lines before the first section
+// header, or a matching section), where they are, so nothing else in the file changes
+// meaning. A new file starts with what the game used from config.txt that the menu does
+// not set (LOG). The file I/O runs on a worker thread, away from the game's display thread.
 
-    const char *separator = last_output_char == '\n' ? "" : "\n\n";
-    return sceIoWrite(fd, separator, strlen(separator)) == (int)strlen(separator);
-}
+#define CONFIG_SAVE_OPTIONS_SIZE 512
+#define CONFIG_SAVE_READ_SIZE    512
+#define CONFIG_TEMP_SUFFIX       ".vgtmp"
+#define CONFIG_OLD_SUFFIX        ".vgold"
+#define CONFIG_ERROR_NOT_FOUND   ((SceUID)0x80010002) // ENOENT
+
+static const char *const g_config_menu_options[FEATURE_INVALID] = {"FB", "IB", "FPS", "MSAA"};
+
+static char g_config_save_options[CONFIG_SAVE_OPTIONS_SIZE];
+static int g_config_save_options_length = 0;
+static uint32_t g_config_save_supported = 0; // bit per vg_feature_t written by the section
+static bool g_config_save_log_disabled = false;
+static volatile vg_config_save_state_t g_config_save_state = CONFIG_SAVE_IDLE;
+
+typedef struct {
+    SceUID fd;
+    char buffer[CONFIG_SAVE_READ_SIZE];
+    int length;
+    int pos;
+} vg_config_reader_t;
+
+typedef struct {
+    SceUID fd;
+    bool has_data;
+    char last_char;
+} vg_config_writer_t;
 
 static bool vg_config_buffer_append(char buffer[], size_t size, int *length, const char format[], ...) {
     if (*length < 0 || (size_t)*length >= size) {
@@ -399,16 +426,18 @@ static bool vg_config_buffer_append(char buffer[], size_t size, int *length, con
     return true;
 }
 
-static bool vg_config_format_current_title_section(char buffer[], size_t size, int *length) {
-    *length = 0;
+static bool vg_config_format_options() {
+    char *buffer = g_config_save_options;
+    const size_t size = sizeof(g_config_save_options);
+    int *length = &g_config_save_options_length;
     const char *off = "off";
 
-    if (!vg_config_buffer_append(buffer, size, length, "[%s,%s,0x%X]\n",
-            g_main.titleid, vg_main_get_self_filename(), g_main.tai_info.module_nid)) {
-        return false;
-    }
+    *length = 0;
+    g_config_save_supported = 0;
+    g_config_save_log_disabled = g_config.log_enabled == FT_DISABLED;
 
     if (g_config.fb_enabled != FT_UNSUPPORTED) {
+        g_config_save_supported |= 1 << FEATURE_FB;
         if (g_config.fb_enabled == FT_ENABLED) {
             if (!vg_config_buffer_append(buffer, size, length, "FB=%dx%d\n", g_config.fb.width, g_config.fb.height)) {
                 return false;
@@ -419,6 +448,7 @@ static bool vg_config_format_current_title_section(char buffer[], size_t size, i
     }
 
     if (g_config.ib_enabled != FT_UNSUPPORTED) {
+        g_config_save_supported |= 1 << FEATURE_IB;
         if (g_config.ib_enabled == FT_ENABLED && g_config.ib_count > 0) {
             if (!vg_config_buffer_append(buffer, size, length, "IB=")) {
                 return false;
@@ -438,6 +468,7 @@ static bool vg_config_format_current_title_section(char buffer[], size_t size, i
     }
 
     if (g_config.fps_enabled != FT_UNSUPPORTED) {
+        g_config_save_supported |= 1 << FEATURE_FPS;
         if (g_config.fps_enabled == FT_ENABLED) {
             if (!vg_config_buffer_append(buffer, size, length, "FPS=%s\n",
                     g_config.fps == FPS_20 ? "20" : g_config.fps == FPS_30 ? "30" : "60")) {
@@ -449,6 +480,7 @@ static bool vg_config_format_current_title_section(char buffer[], size_t size, i
     }
 
     if (g_config.msaa_enabled != FT_UNSUPPORTED) {
+        g_config_save_supported |= 1 << FEATURE_MSAA;
         if (g_config.msaa_enabled == FT_ENABLED) {
             if (!vg_config_buffer_append(buffer, size, length, "MSAA=%s\n",
                     g_config.msaa == MSAA_NONE ? "1" : g_config.msaa == MSAA_2X ? "2" : "4")) {
@@ -459,134 +491,341 @@ static bool vg_config_format_current_title_section(char buffer[], size_t size, i
         }
     }
 
-    return vg_config_buffer_append(buffer, size, length, "\n");
+    return true;
 }
 
-static bool vg_config_replace_title_section(const char path[], const char section[], int section_length) {
-    char temp_path[CONFIG_PATH_SIZE + sizeof(".tmp")];
-    snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
-    sceIoRemove(temp_path);
+// Reads one line with its line break. Returns its length, 0 at the end of the file,
+// or -1 on a read error or a line longer than the config parser accepts.
+static int vg_config_read_line(vg_config_reader_t *reader, char line[], int size) {
+    int length = 0;
 
-    SceUID input = -1;
-    SceUID output = sceIoOpen(temp_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-    if (output < 0) {
-        goto SAVE_FAILURE;
-    }
-
-    input = sceIoOpen(path, SCE_O_RDONLY, 0777);
-    bool had_input = input >= 0;
-    bool section_written = false;
-    bool skip_section = false;
-    bool output_has_data = false;
-    char last_output_char = '\0';
-    char line[IO_CHUNK_SIZE + 1];
-    int line_length = 0;
-
-    if (input >= 0) {
-        char c;
-        while (true) {
-            int read = sceIoRead(input, &c, 1);
-            if (read == 1) {
-                if (line_length >= IO_CHUNK_SIZE) {
-                    goto SAVE_FAILURE;
-                }
-                line[line_length++] = c;
-            } else if (read < 0) {
-                goto SAVE_FAILURE;
-            } else if (line_length == 0) {
-                break;
+    while (true) {
+        if (reader->pos >= reader->length) {
+            reader->length = sceIoRead(reader->fd, reader->buffer, sizeof(reader->buffer));
+            reader->pos = 0;
+            if (reader->length < 0) {
+                return -1;
             }
-
-            if (read == 1 && c != '\n') {
-                continue;
-            }
-
-            line[line_length] = '\0';
-
-            int pos = 0;
-            while (isspace(line[pos])) { pos++; }
-            if (line[pos] == '[') {
-                skip_section = false;
-
-                vg_io_section_header_t header;
-                if (vg_io_parse_section_header(&line[pos], &header).code != IO_OK) {
-                    goto SAVE_FAILURE;
-                }
-
-                skip_section = vg_main_match_current_module(header.titleid, header.self, header.nid, true)
-                    == MODULE_MATCH;
-
-                if (skip_section && !section_written) {
-                    if (!vg_config_write_section_separator(output, output_has_data, last_output_char)
-                            || sceIoWrite(output, section, section_length) != section_length) {
-                        goto SAVE_FAILURE;
-                    }
-
-                    section_written = true;
-                    output_has_data = true;
-                    last_output_char = section[section_length - 1];
-                }
-            }
-
-            if (!skip_section) {
-                if (sceIoWrite(output, line, line_length) != line_length) {
-                    goto SAVE_FAILURE;
-                }
-
-                output_has_data = true;
-                last_output_char = line[line_length - 1];
-            }
-
-            line_length = 0;
-            if (read != 1) {
+            if (reader->length == 0) {
                 break;
             }
         }
 
-        sceIoClose(input);
-        input = -1;
+        char c = reader->buffer[reader->pos++];
+        if (length >= size - 1) {
+            return -1;
+        }
+        line[length++] = c;
+        if (c == '\n') {
+            break;
+        }
     }
 
-    if (!section_written && (!vg_config_write_section_separator(output, output_has_data, last_output_char)
-            || sceIoWrite(output, section, section_length) != section_length)) {
+    line[length] = '\0';
+    return length;
+}
+
+static bool vg_config_rewind(vg_config_reader_t *reader) {
+    reader->length = 0;
+    reader->pos = 0;
+    return sceIoLseek(reader->fd, 0, SCE_SEEK_SET) == 0;
+}
+
+static bool vg_config_write(vg_config_writer_t *writer, const char data[], int length) {
+    if (length <= 0) {
+        return true;
+    }
+    if (sceIoWrite(writer->fd, data, length) != length) {
+        return false;
+    }
+
+    writer->has_data = true;
+    writer->last_char = data[length - 1];
+    return true;
+}
+
+// Writes a whole line (bytes as read, so even a NUL in it is kept), ending it if it was not
+static bool vg_config_write_line(vg_config_writer_t *writer, const char line[], int length) {
+    return vg_config_write(writer, line, length)
+        && (line[length - 1] == '\n' || vg_config_write(writer, "\n", 1));
+}
+
+// Is this line one of the options the menu writes (FB, IB, ... for a supported feature)?
+static bool vg_config_is_saved_option(const char line[], uint32_t supported) {
+    for (int i = 0; i < FEATURE_INVALID; i++) {
+        size_t length = strlen(g_config_menu_options[i]);
+        if (!(supported & (1 << i)) || strncasecmp(line, g_config_menu_options[i], length)) {
+            continue;
+        }
+
+        const char *rhs = line + length;
+        while (isspace(*rhs)) { rhs++; }
+        if (*rhs == '=') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Does the running game read the options under this section header?
+static bool vg_config_header_matches(const char line[]) {
+    // What the parser sees: the line up to its comment or a stray CR
+    char header[IO_CHUNK_SIZE + 1];
+    size_t length = strcspn(line, "#\r");
+    if (length > IO_CHUNK_SIZE) {
+        length = IO_CHUNK_SIZE;
+    }
+    memcpy(header, line, length);
+    header[length] = '\0';
+
+    if (!strncasecmp(header, "[MAIN]", 6) && vg_io_is_line_end(header, 6)) {
+        return false; // only fills in what the game's sections leave unset
+    }
+
+    vg_io_section_header_t parsed;
+    return vg_io_parse_section_header(header, &parsed).code == IO_OK
+        && vg_main_match_current_module(parsed.titleid, parsed.self, parsed.nid, false) == MODULE_MATCH;
+}
+
+static bool vg_config_recover_title_file(const char path[]);
+
+static bool vg_config_write_title_file() {
+    char path[CONFIG_PATH_SIZE];
+    char temp_path[CONFIG_PATH_SIZE + sizeof(CONFIG_TEMP_SUFFIX)];
+    char old_path[CONFIG_PATH_SIZE + sizeof(CONFIG_OLD_SUFFIX)];
+    snprintf(path, sizeof(path), "%s%s.txt", CONFIG_DIR, g_main.titleid);
+    snprintf(temp_path, sizeof(temp_path), "%s" CONFIG_TEMP_SUFFIX, path);
+    snprintf(old_path, sizeof(old_path), "%s" CONFIG_OLD_SUFFIX, path);
+
+    char line[IO_CHUNK_SIZE + 1];
+    vg_config_reader_t reader;
+    reader.length = 0;
+    reader.pos = 0;
+    vg_config_writer_t writer = {-1, false, '\0'};
+
+    sceIoMkdir(CONFIG_DIR, 0777);
+
+    // A save that stopped halfway is finished first, so its files are not lost
+    reader.fd = sceIoOpen(path, SCE_O_RDONLY, 0777);
+    if (reader.fd < 0 && vg_config_recover_title_file(path)) {
+        reader.fd = sceIoOpen(path, SCE_O_RDONLY, 0777);
+    }
+    if (reader.fd < 0 && reader.fd != CONFIG_ERROR_NOT_FOUND) {
+        return false; // there, but unreadable: do not replace it
+    }
+    bool had_file = reader.fd >= 0;
+
+    // First pass: the last part of the file the game reads. The lines before the
+    // first header always count (the file is this title's own). There, the options go
+    // where the first of them is, else at the end of those lines.
+    int block_count = 0;
+    int target_block = 0;
+    int line_count = 0;
+    int first_option_line = -1;
+    int first_header_line = -1;
+    while (had_file) {
+        int length = vg_config_read_line(&reader, line, sizeof(line));
+        if (length < 0) {
+            goto SAVE_FAILURE;
+        }
+        if (length == 0) {
+            break;
+        }
+
+        const char *text = line;
+        while (isspace(*text)) { text++; }
+        if (*text == '[') {
+            block_count++;
+            if (first_header_line < 0) {
+                first_header_line = line_count;
+            }
+            if (vg_config_header_matches(text)) {
+                target_block = block_count;
+            }
+        } else if (block_count == 0 && first_option_line < 0
+                && vg_config_is_saved_option(text, g_config_save_supported)) {
+            first_option_line = line_count;
+        }
+        line_count++;
+    }
+    int insert_line = first_option_line >= 0 ? first_option_line : first_header_line;
+
+    if (had_file && !vg_config_rewind(&reader)) {
         goto SAVE_FAILURE;
     }
 
-    if (sceIoClose(output) < 0) {
-        output = -1;
+    sceIoRemove(temp_path);
+    writer.fd = sceIoOpen(temp_path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (writer.fd < 0) {
         goto SAVE_FAILURE;
     }
 
-    output = -1;
-    if ((had_input && sceIoRemove(path) < 0) || sceIoRename(temp_path, path) < 0) {
+    // A new file replaces config.txt for this title: keep what the game used from it
+    // that the menu does not set
+    if (!had_file && g_config_save_log_disabled && !vg_config_write(&writer, "LOG=off\n", 8)) {
         goto SAVE_FAILURE;
     }
+
+    // Second pass: copy, with the target part's options replaced where they are
+    int block = 0;
+    int line_number = 0;
+    bool options_written = false;
+    while (had_file) {
+        int length = vg_config_read_line(&reader, line, sizeof(line));
+        if (length < 0) {
+            goto SAVE_FAILURE;
+        }
+        if (length == 0) {
+            break;
+        }
+
+        const char *text = line;
+        while (isspace(*text)) { text++; }
+
+        if (target_block == 0 && line_number++ == insert_line) {
+            if (!vg_config_write(&writer, g_config_save_options, g_config_save_options_length)) {
+                goto SAVE_FAILURE;
+            }
+            options_written = true;
+        }
+
+        if (*text == '[') {
+            block++;
+            if (!vg_config_write_line(&writer, line, length)) {
+                goto SAVE_FAILURE;
+            }
+            if (block == target_block) {
+                if (!vg_config_write(&writer, g_config_save_options, g_config_save_options_length)) {
+                    goto SAVE_FAILURE;
+                }
+                options_written = true;
+            }
+            continue;
+        }
+
+        if (block == target_block && vg_config_is_saved_option(text, g_config_save_supported)) {
+            continue;
+        }
+
+        if (!vg_config_write_line(&writer, line, length)) {
+            goto SAVE_FAILURE;
+        }
+    }
+
+    // A file with nothing but other lines before its end (or a new file)
+    if (!options_written && !vg_config_write(&writer, g_config_save_options, g_config_save_options_length)) {
+        goto SAVE_FAILURE;
+    }
+
+    if (reader.fd >= 0) {
+        sceIoClose(reader.fd);
+        reader.fd = -1;
+    }
+
+    int close_result = sceIoClose(writer.fd);
+    writer.fd = -1;
+    if (close_result < 0) {
+        goto SAVE_FAILURE;
+    }
+
+    // Rename cannot replace a file, so the old one moves aside first. If this stops
+    // halfway, vg_config_parse (or the next save) finishes the swap.
+    sceIoRemove(old_path);
+    if (had_file && sceIoRename(path, old_path) < 0) {
+        goto SAVE_FAILURE;
+    }
+    if (sceIoRename(temp_path, path) < 0) {
+        if (had_file) {
+            sceIoRename(old_path, path);
+        }
+        goto SAVE_FAILURE;
+    }
+    sceIoRemove(old_path);
 
     return true;
 
 SAVE_FAILURE:
-    if (input >= 0) {
-        sceIoClose(input);
+    if (reader.fd >= 0) {
+        sceIoClose(reader.fd);
     }
-    if (output >= 0) {
-        sceIoClose(output);
+    if (writer.fd >= 0) {
+        sceIoClose(writer.fd);
     }
     sceIoRemove(temp_path);
     return false;
 }
 
-bool vg_config_save_current_title_override() {
-    char section[512];
-    int section_length;
-    if (!vg_config_format_current_title_section(section, sizeof(section), &section_length)) {
+// A save stopped after moving the old file aside: the new one was complete by then
+static bool vg_config_recover_title_file(const char path[]) {
+    char temp_path[CONFIG_PATH_SIZE + sizeof(CONFIG_TEMP_SUFFIX)];
+    char old_path[CONFIG_PATH_SIZE + sizeof(CONFIG_OLD_SUFFIX)];
+    snprintf(temp_path, sizeof(temp_path), "%s" CONFIG_TEMP_SUFFIX, path);
+    snprintf(old_path, sizeof(old_path), "%s" CONFIG_OLD_SUFFIX, path);
+
+    SceIoStat stat;
+    if (sceIoGetstat(old_path, &stat) < 0) {
         return false;
     }
 
-    sceIoMkdir(CONFIG_DIR, 0777);
+    if (sceIoRename(temp_path, path) >= 0) {
+        sceIoRemove(old_path);
+    } else if (sceIoRename(old_path, path) < 0) {
+        return false;
+    }
 
-    char path[CONFIG_PATH_SIZE];
-    snprintf(path, sizeof(path), "%s%s.txt", CONFIG_DIR, g_main.titleid);
-    return vg_config_replace_title_section(path, section, section_length);
+    vg_log_printf("[CONFIG] Recovered %s from an interrupted save\n", path);
+    return true;
+}
+
+static int vg_config_save_thread(SceSize args, void *argp) {
+    bool ok = vg_config_write_title_file();
+
+    __sync_synchronize();
+    g_config_save_state = ok ? CONFIG_SAVE_OK : CONFIG_SAVE_FAILED;
+    return sceKernelExitDeleteThread(0);
+}
+
+bool vg_config_save_start() {
+    if (g_config_save_state == CONFIG_SAVE_RUNNING) {
+        return false;
+    }
+
+    // Snapshot the settings here, the worker only does the file I/O
+    if (!vg_config_format_options()) {
+        return false;
+    }
+
+    g_config_save_state = CONFIG_SAVE_RUNNING;
+    __sync_synchronize();
+
+    SceUID thread = sceKernelCreateThread("VitaGrafixSave", vg_config_save_thread, 0x10000100, 0x4000, 0, 0, NULL);
+    if (thread < 0 || sceKernelStartThread(thread, 0, NULL) < 0) {
+        if (thread >= 0) {
+            sceKernelDeleteThread(thread);
+        }
+        g_config_save_state = CONFIG_SAVE_FAILED;
+        return false;
+    }
+
+    return true;
+}
+
+vg_config_save_state_t vg_config_save_get_state() {
+    return g_config_save_state;
+}
+
+void vg_config_save_wait() {
+    for (int i = 0; i < 200 && g_config_save_state == CONFIG_SAVE_RUNNING; i++) {
+        sceKernelDelayThread(10000);
+    }
+}
+
+// Where the last parse failed, for the error screen
+static char g_config_error_path[CONFIG_PATH_SIZE] = "";
+
+const char *vg_config_get_error_path() {
+    return g_config_error_path;
 }
 
 vg_io_status_t vg_config_parse() {
@@ -599,11 +838,9 @@ vg_io_status_t vg_config_parse() {
     g_config.ib_enabled   = FT_UNSPECIFIED;
     g_config.fps_enabled  = FT_UNSPECIFIED;
     g_config.msaa_enabled = FT_UNSPECIFIED;
-    g_config.ib_count     = 0;
     g_config_section_id    = 0;
     g_config_ib_section_id = 0;
 
-    g_config.fb = vg_config_framebuffer_resolutions[0];
     g_config.ib[0] = (vg_res_t){960, 544};
     g_config.ib_count = 1;
     g_config.fps = FPS_60;
@@ -612,18 +849,32 @@ vg_io_status_t vg_config_parse() {
     char path[CONFIG_PATH_SIZE];
     snprintf(path, sizeof(path), "%s%s.txt", CONFIG_DIR, g_main.titleid);
 
-    // Prefer a complete title-specific configuration over config.txt.
-    // The file is specific to this title, so options may be listed
-    // without a section header (they are treated as the game's section).
+    // The title's own file (config/<TITLEID>.txt, written by the in-game menu and by
+    // VitaGrafixConfigurator) is used instead of config.txt, which is the fallback, the
+    // way the patch folder is preferred over patchlist.txt. The file is specific to this
+    // title, so options may be listed without a section header (they are the game's section).
     g_config_section = CONFIG_SECTION_GAME;
     g_config_section_id = 1;
     g_config_status = vg_io_parse(path, vg_config_parse_line, false);
+    if (g_config_status.code == IO_ERROR_OPEN_FAILED && vg_config_recover_title_file(path)) {
+        g_config_status = vg_io_parse(path, vg_config_parse_line, false);
+    }
+    const char *parsed_path = path;
 
-    // If does not exist, parse global config.txt
+    // If does not exist, parse global config.txt. It is only read, never written or
+    // created: without one (and without the title's file) the defaults apply.
     if (g_config_status.code == IO_ERROR_OPEN_FAILED) {
+        SceIoStat stat;
         g_config_section = CONFIG_SECTION_NONE;
         g_config_section_id = 0;
-        g_config_status = vg_io_parse(CONFIG_PATH, vg_config_parse_line, true);
+        g_config_status = sceIoGetstat(CONFIG_PATH, &stat) < 0
+            ? (vg_io_status_t){IO_OK, 0, 0}
+            : vg_io_parse(CONFIG_PATH, vg_config_parse_line, false);
+        parsed_path = CONFIG_PATH;
+    }
+
+    if (g_config_status.code != IO_OK) {
+        snprintf(g_config_error_path, sizeof(g_config_error_path), "%s", parsed_path);
     }
 
     // Set unset options to their default values

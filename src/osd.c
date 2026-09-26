@@ -1,11 +1,12 @@
 #include <vitasdk.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "osd.h"
 #include "osd_font.h"
+#include "osd_logo.h"
 
-#define OSD_MAX_STRING_LENGTH  1024
 #define OSD_RESCALE_X(x) (int)((x) * (g_framebuf.width / 960.0f))
 #define OSD_RESCALE_Y(y) (int)((y) * (g_framebuf.height / 544.0f))
 
@@ -25,7 +26,25 @@ static const bitmap_font_t *g_font = &g_fonts[0];
 static rgba_t g_color_text = {.rgba = {255, 255, 255, 255}};
 static rgba_t g_color_bg   = {.rgba = {  0,   0,   0, 255}};
 
-static void osd_draw_rectangle_abs(int x, int y, int width, int height);
+
+// Clips a rectangle in framebuffer pixels, returns false when nothing is left
+static bool osd_clip(int *x, int *y, int *width, int *height) {
+    if (*x < 0) {
+        *width += *x;
+        *x = 0;
+    }
+    if (*y < 0) {
+        *height += *y;
+        *y = 0;
+    }
+    if (*x + *width > (int)g_framebuf.width) {
+        *width = (int)g_framebuf.width - *x;
+    }
+    if (*y + *height > (int)g_framebuf.height) {
+        *height = (int)g_framebuf.height - *y;
+    }
+    return *width > 0 && *height > 0;
+}
 
 static rgba_t osd_blend_color(rgba_t fg, rgba_t bg) {
     uint8_t inv_alpha = 255 - fg.rgba.a;
@@ -88,59 +107,13 @@ uint32_t osd_get_text_width(const char *str) {
 }
 
 uint32_t osd_get_text_height() {
-    return g_font->height * 544.0f / g_framebuf.height;
+    // Rounded up, so lines this far apart never overlap in the framebuffer
+    return (g_font->height * 544 + g_framebuf.height - 1) / g_framebuf.height;
 }
 
 int osd_get_text_end_x(int x, const char *str) {
     int end_x = OSD_RESCALE_X(x) + osd_get_text_width_abs(str);
     return (end_x * 960 + g_framebuf.width - 1) / g_framebuf.width;
-}
-
-void osd_clear_screen() {
-    if (g_color_bg.rgba.a == 255) {
-        osd_fill_color((rgba_t *)g_framebuf.base, g_framebuf.pitch * g_framebuf.height);
-        return;
-    }
-
-    osd_draw_rectangle_abs(0, 0, g_framebuf.width, g_framebuf.height);
-}
-
-void osd_draw_rectangle_fast(int x, int y, int width, int height) {
-    if (g_color_bg.rgba.a == 0 || g_color_bg.rgba.a == 255) {
-        osd_draw_rectangle(x, y, width, height);
-        return;
-    }
-
-    x = OSD_RESCALE_X(x);
-    y = OSD_RESCALE_Y(y);
-    width = OSD_RESCALE_X(width);
-    height = OSD_RESCALE_Y(height);
-
-    for (int yy = y; yy < y + height; yy += 2) {
-        for (int xx = x; xx < x + width; xx += 2) {
-            rgba_t *pixel_rgb = (rgba_t *)g_framebuf.base + yy * g_framebuf.pitch + xx;
-            rgba_t new_color = osd_blend_color(g_color_bg, *pixel_rgb);
-            *pixel_rgb = new_color;
-            if (xx + 1 < x + width) {
-                *(pixel_rgb + 1) = new_color;
-            }
-            if (yy + 1 < y + height) {
-                *(pixel_rgb + g_framebuf.pitch) = new_color;
-                if (xx + 1 < x + width) {
-                    *(pixel_rgb + g_framebuf.pitch + 1) = new_color;
-                }
-            }
-        }
-    }
-}
-
-void osd_draw_rectangle(int x, int y, int width, int height) {
-    x = OSD_RESCALE_X(x);
-    y = OSD_RESCALE_Y(y);
-    width = OSD_RESCALE_X(width);
-    height = OSD_RESCALE_Y(height);
-
-    osd_draw_rectangle_abs(x, y, width, height);
 }
 
 void osd_draw_rounded_rectangle(int x, int y, int width, int height, int radius) {
@@ -174,81 +147,20 @@ void osd_draw_rounded_rectangle(int x, int y, int width, int height, int radius)
             }
         }
 
-        rgba_t *pixels = (rgba_t *)g_framebuf.base + (y + yy) * g_framebuf.pitch + x + inset;
+        int row_x = x + inset;
+        int row_y = y + yy;
         int count = width - inset * 2;
+        int row_height = 1;
+        if (!osd_clip(&row_x, &row_y, &count, &row_height))
+            continue;
+
+        rgba_t *pixels = (rgba_t *)g_framebuf.base + row_y * g_framebuf.pitch + row_x;
         if (g_color_bg.rgba.a == 255) {
             osd_fill_color(pixels, count);
         } else {
             for (int xx = 0; xx < count; xx++) {
                 pixels[xx] = osd_blend_color(g_color_bg, pixels[xx]);
             }
-        }
-    }
-}
-
-void osd_draw_header(const char *text) {
-    char line[OSD_MAX_STRING_LENGTH];
-    int width = 0;
-    int line_count = 0;
-    int text_height = osd_get_text_height();
-    const char *line_begin = text;
-    const char *line_end;
-
-    while (1) {
-        line_end = strchr(line_begin, '\n');
-        size_t line_length = line_end ? line_end - line_begin : strlen(line_begin);
-        memcpy(line, line_begin, line_length);
-        line[line_length] = '\0';
-
-        int line_width = osd_get_text_width(line);
-        if (line_width > width) {
-            width = line_width;
-        }
-
-        line_count++;
-        if (line_end == NULL) {
-            break;
-        }
-        line_begin = line_end + 1;
-    }
-
-    osd_set_back_color(0, 0, 0, 255);
-    osd_draw_rounded_rectangle(20, 20, width + 20, line_count * text_height + (line_count - 1) * 2 + 10, 5);
-    osd_set_back_color(0, 0, 0, 0);
-
-    int y = 25;
-    line_begin = text;
-    while (1) {
-        line_end = strchr(line_begin, '\n');
-        size_t line_length = line_end ? line_end - line_begin : strlen(line_begin);
-        memcpy(line, line_begin, line_length);
-        line[line_length] = '\0';
-
-        osd_draw_string(30, y, line);
-        y += text_height + 2;
-
-        if (line_end == NULL) {
-            break;
-        }
-        line_begin = line_end + 1;
-    }
-}
-
-static void osd_draw_rectangle_abs(int x, int y, int width, int height) {
-    if (g_color_bg.rgba.a == 0)
-        return;
-
-    if (g_color_bg.rgba.a == 255) {
-        for (int yy = y; yy < y + height; yy++) {
-            osd_fill_color((rgba_t *)g_framebuf.base + yy * g_framebuf.pitch + x, width);
-        }
-        return;
-    }
-
-    for (int yy = y; yy < y + height; yy++) {
-        for (int xx = x; xx < x + width; xx++) {
-            rgba_t *pixel_rgb = (rgba_t *)g_framebuf.base + yy * g_framebuf.pitch + xx;
-            *pixel_rgb = osd_blend_color(g_color_bg, *pixel_rgb);
         }
     }
 }
@@ -262,8 +174,8 @@ static void osd_draw_char_abs(char character, int x, int y) {
     int width = g_font->width;
     int x_start = x < 0 ? -x : 0;
     int y_start = y < 0 ? -y : 0;
-    int x_end = x + width > g_framebuf.width ? g_framebuf.width - x : width;
-    int y_end = y + height > g_framebuf.height ? g_framebuf.height - y : height;
+    int x_end = x + width > (int)g_framebuf.width ? (int)g_framebuf.width - x : width;
+    int y_end = y + height > (int)g_framebuf.height ? (int)g_framebuf.height - y : height;
 
     if (x_start >= x_end || y_start >= y_end)
         return;
@@ -328,17 +240,23 @@ void osd_draw_string(int x, int y, const char *str) {
     }
 }
 
-void osd_draw_stringf(int x, int y, const char *format, ...) {
-    char buffer[OSD_MAX_STRING_LENGTH] = "";
-    va_list va;
-
-    va_start(va, format);
-    vsnprintf(buffer, OSD_MAX_STRING_LENGTH, format, va);
-    va_end(va);
-
-    osd_draw_string(x, y, buffer);
+uint32_t osd_get_text_width_small(const char *str) {
+    return strlen(str) * g_fonts[FONT_COUNT - 1].width * 960.0f / g_framebuf.width;
 }
 
+uint32_t osd_get_text_height_small() {
+    return g_fonts[FONT_COUNT - 1].height * 544.0f / g_framebuf.height;
+}
+
+// Like osd_draw_string, in the smallest font (the version under the logo)
+void osd_draw_string_small(int x, int y, const char *str) {
+    const bitmap_font_t *font = g_font;
+    g_font = &g_fonts[FONT_COUNT - 1];
+    osd_draw_string(x, y, str);
+    g_font = font;
+}
+
+// The end of the log, bottom up: from maxy (in framebuffer pixels) to y
 void osd_draw_log(int x, int y, int maxy, const char *str) {
     size_t slen = strlen(str);
     if (slen <= 3)
@@ -352,7 +270,7 @@ void osd_draw_log(int x, int y, int maxy, const char *str) {
     for (int i = slen - 2; i >= 0; i--) {
         if (i == 0 || str[i - 1] == '\n') {
             maxy -= g_font->height;
-            if (maxy < y)
+            if (maxy - g_font->height < y)
                 break;
 
             for (size_t i_cur = 0; i_cur < line_end - i; i_cur++) {
@@ -361,6 +279,32 @@ void osd_draw_log(int x, int y, int maxy, const char *str) {
             }
 
             line_end = i - 1;
+        }
+    }
+}
+
+// The 60x38 VitaGrafix logo (an alpha mask), scaled like everything else
+void osd_draw_logo(int x, int y) {
+    int x0 = OSD_RESCALE_X(x);
+    int y0 = OSD_RESCALE_Y(y);
+    int width = OSD_RESCALE_X(LOGO_WIDTH);
+    int height = OSD_RESCALE_Y(LOGO_HEIGHT);
+    int x1 = x0, y1 = y0, clipped_width = width, clipped_height = height;
+    if (width <= 0 || height <= 0 || !osd_clip(&x1, &y1, &clipped_width, &clipped_height))
+        return;
+
+    rgba_t logo = {.rgba = {255, 255, 255, 255}};
+    for (int yy = y1; yy < y1 + clipped_height; yy++) {
+        const unsigned char *row = g_logo + (yy - y0) * LOGO_HEIGHT / height * LOGO_WIDTH;
+        rgba_t *pixels = (rgba_t *)g_framebuf.base + yy * g_framebuf.pitch;
+
+        for (int xx = x1; xx < x1 + clipped_width; xx++) {
+            logo.rgba.a = row[(xx - x0) * LOGO_WIDTH / width];
+            if (logo.rgba.a == 0xFF) {
+                pixels[xx] = logo;
+            } else if (logo.rgba.a) {
+                pixels[xx] = osd_blend_color(logo, pixels[xx]);
+            }
         }
     }
 }

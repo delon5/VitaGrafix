@@ -50,6 +50,7 @@ target_link_libraries(VitaGrafix
   SceCtrl_stub
   SceKernelModulemgr_stub
   SceLibKernel_stub
+  SceKernelThreadMgr_stub
   SceSysmem_stub
   SceIofilemgr_stub
   SceLibc_stub

@@ -22,10 +22,14 @@ char g_osd_buffer[STRING_BUFFER_SIZE] = "";
 #define DECL_FUNC_HOOK_INTERCEPT_CTRL(index, name, negative) \
     static int name##_patched(int port, SceCtrlData *ctrl, int count) { \
         int ret = TAI_CONTINUE(int, g_main.input_hook_ref[(index)], port, ctrl, count); \
-        if (vg_menu_is_open()) { \
-            for (int i = 0; i < ret; i++) \
-                ctrl[i].buttons = (negative) ? ~0u : 0; \
-        } \
+        vg_menu_filter_ctrl(ctrl, ret < count ? ret : count, (negative)); \
+        return ret; \
+    }
+
+#define DECL_FUNC_HOOK_INTERCEPT_TOUCH(index, name) \
+    static int name##_patched(SceUInt32 port, SceTouchData *data, SceUInt32 count) { \
+        int ret = TAI_CONTINUE(int, g_main.input_hook_ref[(index)], port, data, count); \
+        vg_menu_filter_touch(data, ret < (int)count ? ret : (int)count); \
         return ret; \
     }
 
@@ -37,106 +41,282 @@ DECL_FUNC_HOOK_INTERCEPT_CTRL(4, sceCtrlReadBufferNegative, true)
 DECL_FUNC_HOOK_INTERCEPT_CTRL(5, sceCtrlReadBufferNegative2, true)
 DECL_FUNC_HOOK_INTERCEPT_CTRL(6, sceCtrlReadBufferPositive, false)
 DECL_FUNC_HOOK_INTERCEPT_CTRL(7, sceCtrlReadBufferPositive2, false)
+DECL_FUNC_HOOK_INTERCEPT_CTRL(8, sceCtrlPeekBufferPositiveExt, false)
+DECL_FUNC_HOOK_INTERCEPT_CTRL(9, sceCtrlPeekBufferPositiveExt2, false)
+DECL_FUNC_HOOK_INTERCEPT_CTRL(10, sceCtrlReadBufferPositiveExt, false)
+DECL_FUNC_HOOK_INTERCEPT_CTRL(11, sceCtrlReadBufferPositiveExt2, false)
+DECL_FUNC_HOOK_INTERCEPT_TOUCH(12, sceTouchPeek)
+DECL_FUNC_HOOK_INTERCEPT_TOUCH(13, sceTouchRead)
 
-static int sceDisplaySetFrameBuf_patched(const SceDisplayFrameBuf *pParam, int sync) {
-    // NULL (or a NULL base) is a legal call that blanks the display;
-    // there is nothing to draw the OSD onto
-    if (pParam == NULL || pParam->base == NULL)
-        return TAI_CONTINUE(int, g_main.osd_hook_ref, pParam, sync);
+static const struct {
+    uint32_t nid;
+    const void *func;
+} g_input_hooks[INPUT_HOOK_NUM] = {
+    {0x104ED1A7, sceCtrlPeekBufferNegative_patched},
+    {0x81A89660, sceCtrlPeekBufferNegative2_patched},
+    {0xA9C3CED6, sceCtrlPeekBufferPositive_patched},
+    {0x15F81E8C, sceCtrlPeekBufferPositive2_patched},
+    {0x15F96FB0, sceCtrlReadBufferNegative_patched},
+    {0x27A0C5FB, sceCtrlReadBufferNegative2_patched},
+    {0x67E7AB83, sceCtrlReadBufferPositive_patched},
+    {0xC4226A3E, sceCtrlReadBufferPositive2_patched},
+    {0xA59454D3, sceCtrlPeekBufferPositiveExt_patched},
+    {0x860BF292, sceCtrlPeekBufferPositiveExt2_patched},
+    {0xE2D99296, sceCtrlReadBufferPositiveExt_patched},
+    {0xA7178860, sceCtrlReadBufferPositiveExt2_patched},
+    {0xFF082DF0, sceTouchPeek_patched},
+    {0x169A1D58, sceTouchRead_patched},
+};
 
+// The classic overlay's box width at 960x544 for this configuration
+static int vg_main_get_osd_width() {
+    const vg_config_t config = *vg_config_get();
+
+    int w = 180;      // Fit "960x544" or "60 FPS"
+
+    if (config.fb_enabled == FT_UNSUPPORTED && config.ib_enabled == FT_UNSUPPORTED
+            && (config.msaa_enabled == FT_DISABLED || config.msaa_enabled == FT_UNSPECIFIED)) {
+        w += 60;      // Fit "MSAA: default"
+    } else if (config.fb_enabled == FT_DISABLED || config.fb_enabled == FT_UNSPECIFIED
+            || config.ib_enabled == FT_DISABLED || config.ib_enabled == FT_UNSPECIFIED
+            || config.fps_enabled == FT_DISABLED || config.fps_enabled == FT_UNSPECIFIED) {
+        w += 50;      // Fit "Res: default" or "FPS: default"
+    } else if (config.fb_enabled == FT_UNSUPPORTED && config.ib_enabled == FT_UNSUPPORTED
+            && config.msaa_enabled == FT_ENABLED) {
+        w += 10;      // Fit "MSAA: 4x"
+    }
+
+    if (config.ib_enabled == FT_ENABLED) {
+        if (config.ib[0].width > 999)
+            w += 10;  // Fit "1280x720"
+        if (config.ib_count > 1)
+            w += 110; // Fit "960x544 >> 720x408"
+    }
+    if ((config.fb_enabled != FT_UNSUPPORTED || config.ib_enabled != FT_UNSUPPORTED)
+            && !((config.fb_enabled == FT_ENABLED || config.ib_enabled == FT_ENABLED)           // "960x544 (4x)"
+                && (config.fps_enabled == FT_DISABLED || config.fps_enabled == FT_UNSPECIFIED)) // "FPS: default"
+            && config.msaa_enabled == FT_ENABLED) {
+        w += 50;      // Fit "960x544 (4x)" or "Res: default (4x)"
+    }
+
+    return w;
+}
+
+// The overlay box in the top right corner: logo, version and up to two lines of text
+// (a single line sits at the bottom). Coordinates are in the 960x544 space the menu uses;
+// the spacing follows the font, which at 960x544 gives the classic 70 px high box.
+static void vg_main_draw_overlay_box(int base_width, const char *top, const char *bottom) {
+    int text_width = top ? osd_get_text_width(top) : 0;
+    if (bottom && (int)osd_get_text_width(bottom) > text_width)
+        text_width = osd_get_text_width(bottom);
+
+    // Small framebuffers have no smaller font for the version: keep the text clear of it
+    int version_width = osd_get_text_width_small(VG_VERSION);
+    int text_x = 41 + version_width + 10 > 90 ? 41 + version_width + 10 : 90;
+
+    int line_height = osd_get_text_height();
+    int width = base_width;
+    if (text_x + text_width + 10 > width)
+        width = text_x + text_width + 10;
+    int height = 2 * line_height + 30 > 70 ? 2 * line_height + 30 : 70;
+    int x = 960 - 20 - width;
+    int bottom_y = 20 + height - 14 - line_height;
+
+    // Background
+    osd_set_back_color(0, 0, 0, 200);
+    osd_draw_rounded_rectangle(x, 20, width, height, 0);
+
+    // Logo and version
+    osd_draw_logo(x + 15, 30); // 60x38
+    osd_set_back_color(0, 0, 0, 0);
+    osd_set_text_color(255, 255, 255, 255);
+    osd_draw_string_small(x + 41, 20 + height - 6 - osd_get_text_height_small(), VG_VERSION);
+
+    if (bottom) {
+        osd_draw_string(x + text_x, bottom_y, bottom);
+        if (top)
+            osd_draw_string(x + text_x, bottom_y - line_height, top);
+    } else if (top) {
+        osd_draw_string(x + text_x, bottom_y, top);
+    }
+}
+
+// Draws the OSD (or the menu) onto the frame about to be shown.
+// Returns true when the menu is open.
+static bool vg_main_draw_osd(const SceDisplayFrameBuf *pParam) {
     const vg_config_t config = *vg_config_get();
     const vg_io_status_t config_status = *vg_config_get_status();
     const vg_io_status_t patch_status = *vg_patch_get_status();
 
     // OSD not shown yet? Start the timer
     if (!g_main.osd_timer) {
-        g_main.osd_timer = sceKernelGetProcessTimeLow();
+        g_main.osd_timer = sceKernelGetProcessTimeWide();
     }
 
     osd_update_fb(pParam);
 
-    if (g_main.patch_match == MODULE_MATCH) {
-        bool menu_was_open = vg_menu_is_open();
+    if (g_main.menu_ready) {
         SceCtrlData ctrl;
-        if (sceCtrlPeekBufferPositive(0, &ctrl, 1) > 0) {
-            vg_menu_check_input(&ctrl);
-        }
+        bool has_input = sceCtrlPeekBufferPositive(0, &ctrl, 1) > 0;
 
-        // menu closed and notice is set, reset the OSD timer
-        if (menu_was_open && !vg_menu_is_open() && vg_menu_get_notice() != MENU_NOTICE_NONE) {
-            g_main.osd_timer = sceKernelGetProcessTimeLow();
+        // A new notice (saving, saved, failed) shows the OSD again
+        if (vg_menu_update(has_input ? &ctrl : NULL)) {
+            g_main.osd_timer = sceKernelGetProcessTimeWide();
+            g_main.osd_done = false;
         }
 
         if (vg_menu_is_open()) {
             vg_menu_draw();
-            int ret = TAI_CONTINUE(int, g_main.osd_hook_ref, pParam, sync);
-            sceDisplayWaitVblankStart();
-            return ret;
+            return true;
         }
     }
 
-    // OSD already shown, and all is good, return
-    if (sceKernelGetProcessTimeLow() - g_main.osd_timer > OSD_SHOW_DURATION
-            && config_status.code == IO_OK && patch_status.code == IO_OK) {
-        return TAI_CONTINUE(int, g_main.osd_hook_ref, pParam, sync);
+    // OSD timer finished? Stop drawing. The hook itself stays installed until
+    // module_stop: unhooking from inside the call chain is not safe when another
+    // plugin has hooked the same import (their chain would point at freed memory)
+    if (g_main.osd_done
+            || (sceKernelGetProcessTimeWide() - g_main.osd_timer > OSD_SHOW_DURATION
+            && config_status.code == IO_OK // Show indefinitely on i/o error
+            && patch_status.code == IO_OK)) {
+        g_main.osd_done = true;
+        return false;
     }
 
-    bool has_applied_patches = g_main.inject_num > 0;
-    for (int i = 0; i < MAX_HOOK_NUM; i++) {
-        if (g_main.hook[i] >= 0) {
-            has_applied_patches = true;
-            break;
-        }
-    }
+    vg_menu_notice_t notice = g_main.menu_ready ? vg_menu_get_notice() : MENU_NOTICE_NONE;
 
+    // IO/parse failure?
     if (config_status.code != IO_OK || patch_status.code != IO_OK) {
-        if (config_status.code == IO_ERROR_OPEN_FAILED) {
-            osd_draw_header(OSD_ERROR_HEADER "\n" OSD_MSG_CONFIG_OPEN_FAILED "\n" OSD_MSG_IOPLUS_HINT);
-        } else if (patch_status.code == IO_ERROR_OPEN_FAILED) {
-            osd_draw_header(OSD_ERROR_HEADER "\n" OSD_MSG_PATCH_OPEN_FAILED "\n" OSD_MSG_IOPLUS_HINT);
-        } else if (config_status.code != IO_OK) {
-            osd_draw_header(OSD_ERROR_HEADER "\n" OSD_MSG_CONFIG_ERROR);
-        } else if (patch_status.code != IO_OK) {
-            osd_draw_header(OSD_ERROR_HEADER "\n" OSD_MSG_PATCH_ERROR);
-        }
+        vg_main_draw_overlay_box(vg_main_get_osd_width(), "Error", NULL);
 
+        // Draw short message, one font height per line (20 at 960x544)
+        int line_height = osd_get_text_height();
         osd_set_back_color(0, 0, 0, 255);
+        if (config_status.code == IO_ERROR_OPEN_FAILED) {
+            osd_draw_string(20, 110, OSD_MSG_CONFIG_OPEN_FAILED);
+            osd_draw_string(20, 110 + line_height, OSD_MSG_IOPLUS_HINT);
+        } else if (patch_status.code == IO_ERROR_OPEN_FAILED) {
+            osd_draw_string(20, 110, OSD_MSG_PATCH_OPEN_FAILED);
+            osd_draw_string(20, 110 + line_height, OSD_MSG_IOPLUS_HINT);
+        } else if (config_status.code != IO_OK) {
+            // Which file, and where
+            const char *file = vg_config_get_error_path();
+            if (!strncmp(file, VG_DIR, strlen(VG_DIR)))
+                file += strlen(VG_DIR);
+            char where[96];
+            snprintf(where, sizeof(where), "%s, line %u", file, (unsigned int)config_status.line);
+            osd_draw_string(20, 110, OSD_MSG_CONFIG_ERROR);
+            osd_draw_string(20, 110 + line_height, where);
+        } else if (patch_status.code != IO_OK) {
+            osd_draw_string(20, 110, OSD_MSG_PATCH_ERROR);
+        }
+
+        // Draw the end of the log
         if (config.log_enabled) {
-            osd_draw_log(20, 110, pParam->height, g_osd_buffer);
-        }
-    } else if (g_main.patch_match == MODULE_NID_MISMATCH) {
-        osd_draw_header(OSD_ERROR_HEADER "\n" OSD_MSG_GAME_WRONG_VERSION);
-    } else if (vg_menu_get_notice() == MENU_NOTICE_SAVED) {
-        osd_draw_header(OSD_MSG_CONFIG_SAVED);
-    } else if (vg_menu_get_notice() == MENU_NOTICE_SAVE_FAILED) {
-        osd_draw_header(OSD_MSG_CONFIG_SAVE_FAILED);
-    } else if (g_main.patch_match == MODULE_MATCH && !has_applied_patches) {
-        osd_draw_header(OSD_MSG_PATCHES_AVAILABLE);
-    } else if (config.osd_enabled == FT_ENABLED) {
-        char info[64] = "";
-
-        if (config.fb_enabled == FT_ENABLED) {
-            snprintf(info, sizeof(info), "%dx%d", config.fb.width, config.fb.height);
-        } else if (config.ib_enabled == FT_ENABLED) {
-            snprintf(info, sizeof(info), config.ib_count > 1 ? "%dx%d >> %dx%d" : "%dx%d",
-                    config.ib[0].width, config.ib[0].height,
-                    config.ib[config.ib_count - 1].width, config.ib[config.ib_count - 1].height);
-        }
-        if (config.fps_enabled == FT_ENABLED) {
-            const int fps = config.fps == FPS_60 ? 60 : config.fps == FPS_30 ? 30 : 20;
-            snprintf(info + strlen(info), sizeof(info) - strlen(info), "%s%d FPS", info[0] ? " / " : "", fps);
-        }
-        if (config.msaa_enabled == FT_ENABLED) {
-            const char *msaa = config.msaa == MSAA_4X ? "4x MSAA" : config.msaa == MSAA_2X ? "2x MSAA" : "No MSAA";
-            snprintf(info + strlen(info), sizeof(info) - strlen(info), "%s%s", info[0] ? " / " : "", msaa);
-        }
-
-        if (info[0]) {
-            osd_draw_header(info);
+            osd_draw_log(20, 110 + 2 * line_height, pParam->height, g_osd_buffer);
         }
     }
+    // Wrong version
+    else if (g_main.patch_match == MODULE_NID_MISMATCH) {
+        vg_main_draw_overlay_box(vg_main_get_osd_width(), "Error", NULL);
+        osd_set_back_color(0, 0, 0, 255);
+        osd_draw_string(480 - osd_get_text_width(OSD_MSG_GAME_WRONG_VERSION) / 2, 272 - 20,
+                OSD_MSG_GAME_WRONG_VERSION);
+    }
+    // In-game menu saves
+    else if (notice == MENU_NOTICE_SAVING) {
+        vg_main_draw_overlay_box(180, OSD_MSG_CONFIG_SAVING, NULL);
+    } else if (notice == MENU_NOTICE_SAVED) {
+        vg_main_draw_overlay_box(180, OSD_MSG_CONFIG_SAVED, OSD_MSG_CONFIG_SAVED_2);
+    } else if (notice == MENU_NOTICE_SAVE_FAILED) {
+        vg_main_draw_overlay_box(180, OSD_MSG_CONFIG_SAVE_FAILED, NULL);
+    }
+    // Active settings
+    else {
+        // MSAA
+        char msaa_sm_buf[16] = "";
+        if (config.msaa_enabled == FT_ENABLED) {
+            snprintf(msaa_sm_buf, 16, "%s",
+                    (config.msaa == MSAA_4X ? "4x" :
+                    (config.msaa == MSAA_2X ? "2x" : "1x")));
+        }
 
-    return TAI_CONTINUE(int, g_main.osd_hook_ref, pParam, sync);
+        // 2nd line
+        char fps_buf[16] = "";
+        if (config.fps_enabled == FT_ENABLED) {
+            snprintf(fps_buf, 16, "%d FPS",
+                    config.fps == FPS_60 ? 60 : (config.fps == FPS_30 ? 30 : 20));
+        } else if (config.fps_enabled != FT_UNSUPPORTED) {
+            snprintf(fps_buf, 16, "FPS: default");
+        }
+
+        // 1st line
+        char res_buf[32] = "";
+        if (config.fb_enabled == FT_ENABLED) {
+            snprintf(res_buf, 32, "%dx%d",
+                    config.fb.width,
+                    config.fb.height);
+        } else if (config.ib_enabled == FT_ENABLED) {
+            if (config.ib_count == 1) {
+                snprintf(res_buf, 32, "%dx%d",
+                        config.ib[0].width,
+                        config.ib[0].height);
+            } else {
+                snprintf(res_buf, 32, "%dx%d >> %dx%d",
+                        config.ib[0].width,
+                        config.ib[0].height,
+                        config.ib[config.ib_count - 1].width,
+                        config.ib[config.ib_count - 1].height);
+            }
+        } else if (config.fb_enabled != FT_UNSUPPORTED
+                    || config.ib_enabled != FT_UNSUPPORTED) {
+            snprintf(res_buf, 32, "Res: default");
+        } else if (config.msaa_enabled == FT_ENABLED) {
+            snprintf(res_buf, 32, "MSAA: %s", msaa_sm_buf);
+        } else if (config.msaa_enabled != FT_UNSUPPORTED) {
+            snprintf(res_buf, 16, "MSAA: default");
+        }
+
+        char res_line[64] = "";
+        if (res_buf[0] != '\0') {
+            if (config.msaa_enabled == FT_ENABLED
+                    && (config.fb_enabled != FT_UNSUPPORTED
+                    || config.ib_enabled != FT_UNSUPPORTED))
+                snprintf(res_line, sizeof(res_line), "%s (%s)", res_buf, msaa_sm_buf);
+            else
+                snprintf(res_line, sizeof(res_line), "%s", res_buf);
+        }
+
+        // Resolution above FPS; a single line sits at the bottom
+        vg_main_draw_overlay_box(vg_main_get_osd_width(), res_line[0] ? res_line : NULL, fps_buf[0] ? fps_buf : NULL);
+    }
+
+    return false;
+}
+
+static int sceDisplaySetFrameBuf_patched(const SceDisplayFrameBuf *pParam, int sync) {
+    // NULL (or a NULL base) is a legal call that blanks the display;
+    // there is nothing to draw the OSD onto
+    if (pParam == NULL || pParam->base == NULL || pParam->width == 0 || pParam->height == 0
+            || pParam->pitch < pParam->width
+            || (g_main.osd_done && !g_main.menu_ready))
+        return TAI_CONTINUE(int, g_main.osd_hook_ref, pParam, sync);
+
+    // The OSD has one set of state: if another thread is presenting
+    // at the same time, this frame goes out without it
+    bool menu_open = false;
+    if (!__atomic_test_and_set(&g_main.osd_busy, __ATOMIC_ACQUIRE)) {
+        menu_open = vg_main_draw_osd(pParam);
+        __atomic_clear(&g_main.osd_busy, __ATOMIC_RELEASE);
+    }
+
+    int ret = TAI_CONTINUE(int, g_main.osd_hook_ref, pParam, sync);
+
+    // Keep the menu on screen for a whole refresh
+    if (menu_open) {
+        sceDisplayWaitVblankStart();
+    }
+
+    return ret;
 }
 
 const char *vg_main_get_self_filename() {
@@ -156,6 +336,8 @@ vg_module_match_t vg_main_match_current_module(const char titleid[], const char 
 
 void _start() __attribute__ ((weak, alias ("module_start")));
 int module_start(SceSize argc, const void *args) {
+    bool menu_wanted = false;
+
     g_main.osd_hook = -1;
     g_main.inject_num = 0;
     for (int i = 0; i < MAX_INJECT_NUM; i++) {
@@ -240,25 +422,8 @@ int module_start(SceSize argc, const void *args) {
     if (g_main.patch_match == MODULE_SELF_MISMATCH || g_main.patch_match == MODULE_TITLE_MISMATCH)
         goto EXIT;
 
-    if (config->osd_enabled == FT_ENABLED) {
-        g_main.input_hook[0] = taiHookFunctionImport(&g_main.input_hook_ref[0], TAI_MAIN_MODULE,
-                TAI_ANY_LIBRARY, 0x104ED1A7, sceCtrlPeekBufferNegative_patched);
-        g_main.input_hook[1] = taiHookFunctionImport(&g_main.input_hook_ref[1], TAI_MAIN_MODULE,
-                TAI_ANY_LIBRARY, 0x81A89660, sceCtrlPeekBufferNegative2_patched);
-        g_main.input_hook[2] = taiHookFunctionImport(&g_main.input_hook_ref[2], TAI_MAIN_MODULE,
-                TAI_ANY_LIBRARY, 0xA9C3CED6, sceCtrlPeekBufferPositive_patched);
-        g_main.input_hook[3] = taiHookFunctionImport(&g_main.input_hook_ref[3], TAI_MAIN_MODULE,
-                TAI_ANY_LIBRARY, 0x15F81E8C, sceCtrlPeekBufferPositive2_patched);
-        g_main.input_hook[4] = taiHookFunctionImport(&g_main.input_hook_ref[4], TAI_MAIN_MODULE,
-                TAI_ANY_LIBRARY, 0x15F96FB0, sceCtrlReadBufferNegative_patched);
-        g_main.input_hook[5] = taiHookFunctionImport(&g_main.input_hook_ref[5], TAI_MAIN_MODULE,
-                TAI_ANY_LIBRARY, 0x27A0C5FB, sceCtrlReadBufferNegative2_patched);
-        g_main.input_hook[6] = taiHookFunctionImport(&g_main.input_hook_ref[6], TAI_MAIN_MODULE,
-                TAI_ANY_LIBRARY, 0x67E7AB83, sceCtrlReadBufferPositive_patched);
-        g_main.input_hook[7] = taiHookFunctionImport(&g_main.input_hook_ref[7], TAI_MAIN_MODULE,
-                TAI_ANY_LIBRARY, 0xC4226A3E, sceCtrlReadBufferPositive2_patched);
-        vg_menu_init();
-    }
+    // In-game menu, for a game this patch matches that has something to configure
+    menu_wanted = config->osd_enabled == FT_ENABLED && g_main.patch_match == MODULE_MATCH && vg_menu_init();
 
 EXIT_HOOK_OSD:
     // Hook sceDisplaySetFrameBuf for OSD
@@ -273,6 +438,19 @@ EXIT_HOOK_OSD:
         g_main.osd_done = false;
         vg_log_printf("[MAIN] OSD hook on sceDisplaySetFrameBuf: 0x%X (match=%d)\n", g_main.osd_hook, g_main.patch_match);
 
+        if (g_main.osd_hook >= 0 && menu_wanted) {
+            int hooked = 0;
+            for (int i = 0; i < INPUT_HOOK_NUM; i++) {
+                g_main.input_hook[i] = taiHookFunctionImport(&g_main.input_hook_ref[i], TAI_MAIN_MODULE,
+                        TAI_ANY_LIBRARY, g_input_hooks[i].nid, g_input_hooks[i].func);
+                if (g_main.input_hook[i] >= 0)
+                    hooked++;
+            }
+            // Without a single input hook the game would act on everything done in the menu
+            g_main.menu_ready = hooked > 0;
+            vg_log_printf("[MAIN] Menu %s, %d input hooks\n", hooked > 0 ? "ready" : "unavailable", hooked);
+        }
+
         if (config_status.code != IO_OK || patch_status.code != IO_OK) {
             vg_log_read(g_osd_buffer, STRING_BUFFER_SIZE);
         }
@@ -284,6 +462,9 @@ EXIT:
 }
 
 int module_stop(SceSize argc, const void *args) {
+    // A menu save may still be writing the config
+    vg_config_save_wait();
+
     // Release OSD hook
     if (g_main.osd_hook >= 0) {
         taiHookRelease(g_main.osd_hook, g_main.osd_hook_ref);
